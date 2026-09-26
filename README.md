@@ -54,7 +54,7 @@ check-coverage.sh      asserts every reference binary is patchable
 .github/patch-check.sh verifies a patched image
 ```
 
-Notes: the key pair is in this (private) repository, so it is not secret - it
+Notes: the key pair is in this repository, so it is not secret - it
 only signs licences for binaries patched with its public key. Licence renewal
 against `license.stalw.art` fails, which is expected; `--days` defaults to 10
 years. On 0.12.x and later, acceptance cannot be asserted automatically, so
