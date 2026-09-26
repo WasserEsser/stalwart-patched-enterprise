@@ -50,40 +50,71 @@ jobs:
           MANUAL_OLD: ${{ inputs.mail_server_tag }}
         run: |
           set -euo pipefail
+          : > /tmp/discovered.txt
+
+          # The version decides where the licence lives, and therefore what
+          # patch-check can assert: same rule as mode() in the discovery below.
+          mode_for() {
+            case "${1#v}" in
+              0.9*|0.10*|0.11*) echo toml ;;
+              0.12*|0.13*|0.14*|0.15*) echo structural ;;
+              *) echo json ;;
+            esac
+          }
 
           # repo | tag | binary | user | mode
           if [ -n "$MANUAL_NEW" ]; then
-            echo "stalwartlabs/stalwart|$MANUAL_NEW|/usr/local/bin/stalwart|stalwart|json"
+            echo "stalwartlabs/stalwart|$MANUAL_NEW|/usr/local/bin/stalwart|stalwart|$(mode_for "$MANUAL_NEW")" >> /tmp/discovered.txt
           fi
           if [ -n "$MANUAL_OLD" ]; then
-            echo "stalwartlabs/mail-server|$MANUAL_OLD|/usr/local/bin/stalwart-mail|root|toml"
-          fi
-          if [ -n "$MANUAL_NEW" ] || [ -n "$MANUAL_OLD" ]; then
-            exit 0
+            echo "stalwartlabs/mail-server|$MANUAL_OLD|/usr/local/bin/stalwart-mail|root|$(mode_for "$MANUAL_OLD")" >> /tmp/discovered.txt
           fi
 
-          python3 - <<'PY'
+          if [ -z "$MANUAL_NEW" ] && [ -z "$MANUAL_OLD" ]; then
+          python3 - <<'PY' >> /tmp/discovered.txt
           import json, re, sys, urllib.request
 
-          # repo, binary, container user, patch-check mode
+          # repo, binary, container user
           REPOS = [
-              ("stalwartlabs/stalwart",    "/usr/local/bin/stalwart",      "stalwart", "json"),
-              ("stalwartlabs/mail-server", "/usr/local/bin/stalwart-mail", "root",     "toml"),
+              ("stalwartlabs/stalwart",    "/usr/local/bin/stalwart",      "stalwart"),
+              ("stalwartlabs/mail-server", "/usr/local/bin/stalwart-mail", "root"),
           ]
 
           def version(tag):
               return tuple(int(x) for x in re.findall(r"\d+", tag))
 
-          for repo, binary, user, mode in REPOS:
+          def mode(tag):
+              # What patch-check can assert depends on where the licence lives:
+              #   0.9 - 0.11   plain config.toml, so acceptance is testable
+              #   0.12 - 0.15  registry, and no config.json to boot with
+              #   0.16+        registry + config.json, so the server can be booted
+              v = version(tag)
+              return "toml" if v < (0, 12, 0) else ("json" if v >= (0, 16, 0) else "structural")
+
+          def all_tags(repo):
+              # This endpoint pages by last-updated, so page one holds the newest
+              # 100 tags only: taking results[-1] of it made "oldest" mean "100th
+              # newest", which drifts upward with every release. Walk the pages.
+              tags, pages = [], 0
               url = f"https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100"
-              try:
+              while url and pages < 20:                # hard stop: 2000 tags
                   with urllib.request.urlopen(url, timeout=60) as fh:
                       data = json.load(fh)
+                  tags += [r.get("name", "") for r in data.get("results", [])]
+                  nxt = data.get("next")
+                  # `next` is a full URL here; accept a bare page number too.
+                  url = (f"https://hub.docker.com/v2/repositories/{repo}/tags"
+                         f"?page_size=100&page={nxt}") if isinstance(nxt, int) else nxt
+                  pages += 1
+              return tags
+
+          for repo, binary, user in REPOS:
+              try:
+                  tags = all_tags(repo)
               except Exception as exc:                      # network hiccup: skip repo
                   print(f"WARN: cannot list {repo} tags: {exc}", file=sys.stderr)
                   continue
 
-              tags = [r.get("name", "") for r in data.get("results", [])]
               tags = [t for t in tags if re.fullmatch(r"v?\d+\.\d+\.\d+", t)]
               # 0.3.0 - 0.8.5 predate the enterprise licensing code entirely
               # (no license.rs), so there is no public key to replace.
@@ -93,8 +124,20 @@ jobs:
                   continue
 
               for t in (tags[0], tags[-1]):
-                  print(f"{repo}|{t}|{binary}|{user}|{mode}")
+                  print(f"{repo}|{t}|{binary}|{user}|{mode(t)}")
           PY
+          fi
+
+          # Publish the tags as a step output. The build step's `if:` reads
+          # this, and without it the job reported success while testing
+          # nothing: the discovery only printed to stdout.
+          {
+            echo 'new_tags<<__TAGS__'
+            cat /tmp/discovered.txt
+            echo '__TAGS__'
+          } >> "$GITHUB_OUTPUT"
+
+          echo "discovered:"; sed 's/^/  /' /tmp/discovered.txt
 
       - name: Build and check each tag
         if: steps.discover.outputs.new_tags != ''
@@ -131,9 +174,6 @@ jobs:
               FAILED="${FAILED}${FAILED:+, }${REPO}:${TAG}"
             fi
           done
-
-          echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
-          echo "failed=${FAILED}" >> "$GITHUB_OUTPUT"
 
           echo "checked ok: ${OK:-none}"
           echo "FAILED:     ${FAILED:-none}"

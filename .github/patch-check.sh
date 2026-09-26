@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# Usage: patch-check.sh <image> [binary] [json|toml] [original-image]
+# Usage: patch-check.sh <image> [binary] [json|toml|structural] [original-image]
 # toml: mint a licence, require acceptance at runtime, and require the original
-#   image (if given) to reject that same licence.
-# json: structural only - the vendor key must be gone and the server must boot
-#   (0.12.x+ keeps the licence in the registry, set through the admin API).
+#   image (if given) to reject that same licence. 0.9.x - 0.11.x, where the
+#   licence sits in a plain config.toml.
+# json: structural check plus a boot. 0.16.x and up, which read config.json.
+# structural: key replacement only. For 0.12.x - 0.15.x, where the licence
+#   lives in the registry (so no key can be asserted at runtime) and the config
+#   is neither TOML nor config.json, so there is nothing meaningful to boot.
 set -uo pipefail
 
 IMAGE="${1:-}"
 BINARY="${2:-/usr/local/bin/stalwart}"
 MODE="${3:-json}"
 ORIGINAL="${4:-}"
-[ -n "$IMAGE" ] || { echo "usage: $0 <image> [binary] [json|toml] [original-image]"; exit 2; }
-case "$MODE" in json|toml) ;; *) echo "mode must be json or toml"; exit 2 ;; esac
+[ -n "$IMAGE" ] || { echo "usage: $0 <image> [binary] [json|toml|structural] [original-image]"; exit 2; }
+case "$MODE" in json|toml|structural) ;; *) echo "mode must be json, toml or structural"; exit 2 ;; esac
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -40,6 +43,13 @@ case "$rc" in
     0) printf '%s\n' "$out" | sed 's/^/    /'; fail "the vendor key is still present (unpatched binary)" ;;
     *) printf '%s\n' "$out" | sed 's/^/    /'; fail "patch.sh exited $rc" ;;
 esac
+
+if [ "$MODE" = "structural" ]; then
+    echo "  vendor key replaced, and 0.12.x - 0.15.x keeps its licence in the"
+    echo "  registry, so there is no runtime acceptance to assert here"
+    echo "PATCH_OK: $IMAGE ($BINARY, mode=$MODE)"
+    exit 0
+fi
 
 if [ "$MODE" = "json" ]; then
     echo '{"@type":"RocksDb","path":"/var/lib/stalwart/data"}' > "$TMP/config.json"
