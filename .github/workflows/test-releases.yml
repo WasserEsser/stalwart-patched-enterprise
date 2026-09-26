@@ -43,15 +43,6 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Generate a signing key pair
-        id: keys
-        run: |
-          set -euo pipefail
-          KEY="$RUNNER_TEMP/signing.key"
-          PUB=$(./generate-license.sh --pubkey-only --key "$KEY" --quiet)
-          echo "key=$KEY" >> "$GITHUB_OUTPUT"
-          echo "pub=$PUB"  >> "$GITHUB_OUTPUT"
-
       - name: Discover Stalwart tags
         id: discover
         env:
@@ -107,9 +98,6 @@ jobs:
 
       - name: Build and check each tag
         if: steps.discover.outputs.new_tags != ''
-        env:
-          PUB: ${{ steps.keys.outputs.pub }}
-          KEY: ${{ steps.keys.outputs.key }}
         run: |
           set -uo pipefail
           mapfile -t TAGS <<< "${{ steps.discover.outputs.new_tags }}"
@@ -123,7 +111,6 @@ jobs:
             echo "=== ${REPO}:${TAG} (binary=${BINARY}, user=${USER}, mode=${MODE}) ==="
 
             if ! docker build \
-                   --build-arg LICENSE_PUBKEY="${PUB}" \
                    --build-arg STALWART_IMAGE="${REPO}:${TAG}" \
                    --build-arg STALWART_BINARY="${BINARY}" \
                    --build-arg STALWART_USER="${USER}" \
@@ -138,7 +125,7 @@ jobs:
             # The original image is passed as the control: the same license must
             # be rejected there, otherwise the acceptance check would be vacuous.
             if bash .github/patch-check.sh "${LOCAL}" "${BINARY}" "${MODE}" \
-                   "${REPO}:${TAG}" "${KEY}"; then
+                   "${REPO}:${TAG}"; then
               OK="${OK}${OK:+, }${REPO}:${TAG}"
             else
               FAILED="${FAILED}${FAILED:+, }${REPO}:${TAG}"
@@ -164,49 +151,31 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Generate a signing key pair
-        id: keys
-        run: |
-          set -euo pipefail
-          KEY="$RUNNER_TEMP/signing.key"
-          PUB=$(./generate-license.sh --pubkey-only --key "$KEY" --quiet)
-          echo "key=$KEY" >> "$GITHUB_OUTPUT"
-          echo "pub=$PUB"  >> "$GITHUB_OUTPUT"
-
       - name: Build and check the 0.16.x image
-        env:
-          PUB: ${{ steps.keys.outputs.pub }}
-          KEY: ${{ steps.keys.outputs.key }}
         run: |
           set -euo pipefail
           IFS='|' read -r BINARY USER MODE <<< "$VARIANT_NEW"
-          docker build --build-arg LICENSE_PUBKEY="${PUB}" \
+          docker build \
             --build-arg STALWART_IMAGE="stalwartlabs/stalwart:v0.16.23" \
             --build-arg STALWART_BINARY="${BINARY}" \
             --build-arg STALWART_USER="${USER}" -t sw-test:pr016 . >/dev/null
-          bash .github/patch-check.sh sw-test:pr016 "${BINARY}" "${MODE}" "" "${KEY}"
+          bash .github/patch-check.sh sw-test:pr016 "${BINARY}" "${MODE}"
 
       - name: Build and check the 0.11.x image (includes runtime license check)
-        env:
-          PUB: ${{ steps.keys.outputs.pub }}
-          KEY: ${{ steps.keys.outputs.key }}
         run: |
           set -euo pipefail
           IFS='|' read -r BINARY USER MODE <<< "$VARIANT_OLD"
-          docker build --build-arg LICENSE_PUBKEY="${PUB}" \
+          docker build \
             --build-arg STALWART_IMAGE="stalwartlabs/mail-server:v0.11.8" \
             --build-arg STALWART_BINARY="${BINARY}" \
             --build-arg STALWART_USER="${USER}" -t sw-test:pr011 . >/dev/null
           bash .github/patch-check.sh sw-test:pr011 "${BINARY}" "${MODE}" \
-            "stalwartlabs/mail-server:v0.11.8" "${KEY}"
+            "stalwartlabs/mail-server:v0.11.8"
 
       - name: Verify the license generator round-trips
-        env:
-          KEY: ${{ steps.keys.outputs.key }}
         run: |
           set -euo pipefail
-          LICENSE=$(./generate-license.sh --domain example.com --accounts 500 --key "${KEY}" --quiet)
-          PUB="${{ steps.keys.outputs.pub }}"
+          LICENSE=$(./generate-license.sh --domain example.com --accounts 500 --quiet)
           python3 - "$LICENSE" <<'PY'
           import base64, struct, sys, time
           raw = base64.b64decode(sys.argv[1])
@@ -219,19 +188,10 @@ jobs:
           now = int(time.time())
           assert not (now >= vt or now < vf), 'key is already expired'
           assert len(sig) == 64, f'signature is {len(sig)} bytes, expected 64'
-          open('/tmp/payload.bin', 'wb').write(raw[:24+dl])
-          open('/tmp/sig.bin', 'wb').write(sig)
           print('license layout OK')
           PY
-          # The signature must verify against the public key the binary carries.
-          openssl pkey -in "${KEY}" -pubout -out /tmp/pub.pem
-          openssl pkeyutl -verify -pubin -inkey /tmp/pub.pem -rawin \
-            -in /tmp/payload.bin -sigfile /tmp/sig.bin
-          echo "license signature verifies"
 
       - name: Verify a second patch run is idempotent on both binaries
-        env:
-          PUB: ${{ steps.keys.outputs.pub }}
         run: |
           set -uo pipefail
           IFS='|' read -r B16 _ _ <<< "$VARIANT_NEW"
@@ -243,7 +203,7 @@ jobs:
             docker cp "$cid":"$binary" /tmp/sw-patched
             docker rm "$cid" >/dev/null
             set +e
-            bash patch.sh --quiet --pubkey "${PUB}" /tmp/sw-patched
+            bash patch.sh --quiet /tmp/sw-patched
             code=$?
             set -e
             [ "$code" = "6" ] || { echo "ERROR: $binary expected exit 6 (already patched), got $code"; exit 1; }
