@@ -9,7 +9,7 @@ still rejected.
 ## How to run
 
 ```sh
-# 1. patched image (add the build args from the Dockerfile for 0.9.x - 0.11.x)
+# 1. patched image (defaults to stalwartlabs/stalwart:latest, i.e. 0.12.x+)
 docker build -t stalwart-patched .
 
 # 2. licence
@@ -17,7 +17,9 @@ docker build -t stalwart-patched .
 
 # 3. hand it to the server
 #    0.9.x - 0.11.x: [enterprise] license-key = "..." in config.toml
-#    0.12.x and later: Administration -> Enterprise, or the admin API
+#    0.12.x and later: Administration -> Enterprise in the WebUI, or the admin API.
+#      The field is a secret object, not a bare string:
+#        {"licenseKey": {"@type": "Value", "secret": "<key>"}}
 docker logs <container> 2>&1 | grep -i licens
 #    -> Server licensing event ... license key is valid, domain = "example.com"
 ```
@@ -25,8 +27,8 @@ docker logs <container> 2>&1 | grep -i licens
 To patch a binary directly instead of building an image:
 
 ```sh
-./patch.sh ./stalwart-mail            # in place
-./patch.sh --dry-run ./stalwart-mail  # report offsets, change nothing
+./patch.sh ./stalwart            # in place
+./patch.sh --dry-run ./stalwart  # report offsets, change nothing
 ```
 
 `--domain` must be the registrable domain of the server hostname
@@ -42,7 +44,15 @@ To patch a binary directly instead of building an image:
 
 The key is identical in every supported build and appears exactly once as two
 16-byte halves, which is why no per-version patterns are needed.
-`./check-coverage.sh` checks that property over every reference binary.
+`./check-coverage.sh` checks that property over every reference binary, extracted
+from each release's image or tarball into `./bins` (any directory can be passed
+as an argument).
+
+0.9.x - 0.11.x is a different product line: a different image
+(`stalwartlabs/mail-server`), binary path and container user, so building a
+patched image for it needs the build args shown in the Dockerfile header. That
+line is also the only one whose licence acceptance can be asserted at runtime,
+which is why the CI job builds it on every pull request.
 
 ## Files
 

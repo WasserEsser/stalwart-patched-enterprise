@@ -4,10 +4,11 @@
 # is still present as exactly one copy of each half.
 #
 # Usage: check-coverage.sh [binary-dir]
+# Defaults to ./bins, where the extracted release binaries live (see README).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BINS="${1:-$HOME/.hermes/cache/scratch/bins}"
+BINS="${1:-$HERE/bins}"
 [ -d "$BINS" ] || { echo "No binary directory at '$BINS'" >&2; exit 1; }
 
 ok=0

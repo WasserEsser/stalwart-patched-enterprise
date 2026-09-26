@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Usage: patch.sh [--dry-run] [--quiet] <binary>
-# Exit codes: 0 patched, 3 no binary, 4 not found, 5 not writable, 6 already
-# patched, 7 no licence key found, 8 only one half present, 9 write failed,
-# 10 read-back mismatch.
+# Exit codes: 0 patched, 1 usage or read error, 2 missing dependency, 3 no
+# binary, 4 not found, 5 not writable, 6 already patched, 7 no licence key
+# found, 8 only one half present, 9 write failed, 10 read-back mismatch.
 set -uo pipefail
 
 # Vendor key (license.rs: UnparsedPublicKey::new(&ED25519, vec![118, 10, ...]))

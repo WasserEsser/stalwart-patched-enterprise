@@ -12,9 +12,9 @@ stalwartlabs-*
 *.idb
 
 # Generated license keys and local test configs
-# *.key is the Ed25519 private key that signs licenses: never commit it. Losing
-# it means rebuilding the patched image from the official one with a new key
-# pair (patch.sh only replaces the vendor key, so it cannot re-key in place).
+# The signing key pair is hardcoded in generate-license.sh (see README), so
+# there is no private key file to commit or lose; *.key only covers licence
+# files written out by hand.
 *.key
 stalwart-license.key
 /tmp/
