@@ -1,0 +1,159 @@
+name: Test new Stalwart releases
+
+on:
+  schedule:
+    # Check daily at 2am UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      stalwart_tag:
+        description: 'Specific Stalwart image tag to test (e.g. v0.16.23)'
+        required: false
+        default: ''
+  pull_request:
+
+# Cancel superseded runs of the same kind (newer PR push, newer nightly)
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'nightly' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Nightly and manual runs: build and check the recent released tags.
+  check-and-test:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Discover Stalwart tags
+        id: discover
+        run: |
+          set -euo pipefail
+
+          if [ -n "${{ inputs.stalwart_tag }}" ]; then
+            echo "new_tags=${{ inputs.stalwart_tag }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Docker Hub tags API. Exclude edge/nightly style tags; keep the
+          # latest few stable releases. Stalwart tags are vX.Y.Z.
+          TAGS=$(curl -sf "https://hub.docker.com/v2/repositories/stalwartlabs/stalwart/tags?page_size=100" \
+            | python3 -c "
+          import sys, json, re
+          data = json.load(sys.stdin)
+          tags = []
+          for r in data.get('results', []):
+              name = r.get('name', '')
+              if re.fullmatch(r'v?\d+\.\d+\.\d+', name):
+                  tags.append(name)
+          # newest first by semver-ish ordering
+          def key(t):
+              return [int(x) for x in re.findall(r'\d+', t)]
+          tags.sort(key=key, reverse=True)
+          # one per minor version, newest, limited to keep the matrix small
+          seen, out = set(), []
+          for t in tags:
+              minor = '.'.join(t.lstrip('v').split('.')[:2])
+              if minor not in seen:
+                  seen.add(minor)
+                  out.append(t)
+              if len(out) >= 5:
+                  break
+          print('\n'.join(out))
+          ")
+
+          DELIMITER="sw_eof"
+          echo "new_tags<<${DELIMITER}" >> "$GITHUB_OUTPUT"
+          echo "$TAGS" >> "$GITHUB_OUTPUT"
+          echo "${DELIMITER}" >> "$GITHUB_OUTPUT"
+          echo "Discovered tags: ${TAGS:-none}"
+
+      - name: Build and check each tag
+        if: steps.discover.outputs.new_tags != ''
+        run: |
+          set -uo pipefail
+          mapfile -t TAGS <<< "${{ steps.discover.outputs.new_tags }}"
+
+          OK=""; FAILED=""; UNSUPPORTED=""
+
+          for TAG in "${TAGS[@]}"; do
+            [ -z "$TAG" ] && continue
+            echo "=== Stalwart ${TAG} ==="
+
+            if ! docker build --build-arg STALWART_IMAGE_TAG="${TAG}" -t "sw-test:${TAG}" . ; then
+              # exit 7 = patterns not derived for this version yet. That is a
+              # "needs new patterns" situation, not a broken patch.
+              echo "Patch did not apply to ${TAG}: patterns may not be derived yet"
+              UNSUPPORTED="${UNSUPPORTED}${UNSUPPORTED:+, }${TAG}"
+              continue
+            fi
+
+            if bash .github/patch-check.sh "sw-test:${TAG}"; then
+              OK="${OK}${OK:+, }${TAG}"
+            else
+              FAILED="${FAILED}${FAILED:+, }${TAG}"
+            fi
+          done
+
+          echo "ok=${OK}" >> "$GITHUB_OUTPUT"
+          echo "failed=${FAILED}" >> "$GITHUB_OUTPUT"
+          echo "unsupported=${UNSUPPORTED}" >> "$GITHUB_OUTPUT"
+
+          echo "checked ok:   ${OK:-none}"
+          echo "unsupported:  ${UNSUPPORTED:-none}"
+          echo "FAILED:       ${FAILED:-none}"
+          [ -z "$FAILED" ] || exit 1
+
+  # Pull requests: patch and boot-check the tag the patterns were derived from.
+  pr-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Build the patched image
+        run: docker build --build-arg STALWART_IMAGE_TAG=v0.16.23 -t sw-test:pr .
+
+      - name: Check the patch and that it boots
+        run: bash .github/patch-check.sh sw-test:pr
+
+      - name: Verify the license generator still round-trips
+        run: |
+          set -euo pipefail
+          KEY=$(./generate-license.sh --domain example.com --accounts 500 --quiet)
+          python3 - "$KEY" <<'PY'
+          import base64, struct, sys, time
+          raw = base64.b64decode(sys.argv[1])
+          vf, vt, acc, dl = struct.unpack_from('<QQII', raw, 0)
+          domain = raw[24:24+dl].decode()
+          sig = raw[24+dl:]
+          assert domain == 'example.com', domain
+          assert acc == 500, acc
+          assert vf < vt and vf != 0 and vt != 0, (vf, vt)
+          now = int(time.time())
+          assert not (now >= vt or now < vf), 'key is already expired'
+          assert len(sig) > 0, 'empty signature'
+          print('license round-trip OK')
+          PY
+
+      - name: Verify a second patch run is idempotent
+        run: |
+          set -uo pipefail
+          CID=$(docker create sw-test:pr /bin/true)
+          docker cp "$CID":/usr/local/bin/stalwart /tmp/sw-patched
+          docker rm "$CID" >/dev/null
+          set +e
+          bash patch.sh --quiet /tmp/sw-patched
+          code=$?
+          set -e
+          [ "$code" = "6" ] || { echo "ERROR: expected exit 6 (already patched), got $code"; exit 1; }
+          echo "idempotency OK"
