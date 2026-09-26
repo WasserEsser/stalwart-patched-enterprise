@@ -65,20 +65,20 @@ translate_0a() {
     printf '%s' "$out"
 }
 
-hex_to_pcre() {
-    local hex=$1 out="" i
-    for ((i = 0; i < ${#hex}; i += 2)); do out+="\\x${hex:i:2}"; done
-    printf '%s' "$out"
-}
+hex_to_bytes() { printf '%s' "$1" | xxd -r -p; }
 
+# grep -P is not portable (GNU grep 3.7 and busybox disagree on \x0d in the
+# pattern), so the needle is written to a file and matched with -F instead.
 find_half() {
-    local hex=$1 off raw
-    LC_ALL=C grep -aboP "$(hex_to_pcre "$(translate_0a "$hex")")" "$TMP" 2>/dev/null |
-    while IFS=: read -r off _; do
+    local hex=$1 off raw nf="${TMP}.needle"
+    hex_to_bytes "$(translate_0a "$hex")" > "$nf"
+    LC_ALL=C grep -Fabo -f "$nf" "$TMP" 2>/dev/null | cut -d: -f1 |
+    while read -r off; do
         [ -n "$off" ] || continue
         raw=$(dd if="$BINARY_FILE" bs=1 skip="$off" count=16 2>/dev/null | xxd -p -c 16)
         [ "$raw" = "$hex" ] && printf '%s\n' "$off"
     done
+    rm -f "$nf"
 }
 
 mapfile -t A_OFFS < <(find_half "$VENDOR_A")
