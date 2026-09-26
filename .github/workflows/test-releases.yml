@@ -1,4 +1,4 @@
-name: Test new Stalwart releases
+name: Test Stalwart releases
 
 on:
   schedule:
@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       stalwart_tag:
-        description: 'stalwartlabs/stalwart (0.16.x) tag to test, e.g. v0.16.23'
+        description: 'stalwartlabs/stalwart (0.12.x+) tag to test, e.g. v0.16.23'
         required: false
         default: ''
       mail_server_tag:
-        description: 'stalwartlabs/mail-server (0.11.x) tag to test, e.g. v0.11.8'
+        description: 'stalwartlabs/mail-server (0.9.x-0.11.x) tag to test, e.g. v0.11.8'
         required: false
         default: ''
   pull_request:
@@ -25,13 +25,15 @@ permissions:
   contents: read
 
 env:
-  # repo | binary inside the image | container user | patch-check mode
-  VARIANT_016: 'stalwartlabs/stalwart|/usr/local/bin/stalwart|stalwart|json'
-  VARIANT_011: 'stalwartlabs/mail-server|/usr/local/bin/stalwart-mail|root|toml'
+  # binary inside the image | container user | patch-check mode
+  VARIANT_NEW: '/usr/local/bin/stalwart|stalwart|json'
+  VARIANT_OLD: '/usr/local/bin/stalwart-mail|root|toml'
 
 jobs:
-  # Nightly and manual runs: build and check the recent released tags of both
-  # product lines.
+  # Nightly and manual runs. The embedded public key is identical in every
+  # release from 0.9.0 on, so testing every version is pointless: the newest tag
+  # of each product line is what could introduce a new key or a new layout. The
+  # oldest tag of each line is kept as a cheap canary for re-tagged images.
   check-and-test:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -41,17 +43,31 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
+      - name: Generate a signing key pair
+        id: keys
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/signing.key"
+          PUB=$(./generate-license.sh --pubkey-only --key "$KEY" --quiet)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "pub=$PUB"  >> "$GITHUB_OUTPUT"
+
       - name: Discover Stalwart tags
         id: discover
         env:
-          MANUAL_016: ${{ inputs.stalwart_tag }}
-          MANUAL_011: ${{ inputs.mail_server_tag }}
+          MANUAL_NEW: ${{ inputs.stalwart_tag }}
+          MANUAL_OLD: ${{ inputs.mail_server_tag }}
         run: |
           set -euo pipefail
 
-          if [ -n "$MANUAL_016" ] || [ -n "$MANUAL_011" ]; then
-            [ -z "$MANUAL_016" ] || echo "stalwartlabs/stalwart|$MANUAL_016|/usr/local/bin/stalwart|stalwart|json"
-            [ -z "$MANUAL_011" ] || echo "stalwartlabs/mail-server|$MANUAL_011|/usr/local/bin/stalwart-mail|root|toml"
+          # repo | tag | binary | user | mode
+          if [ -n "$MANUAL_NEW" ]; then
+            echo "stalwartlabs/stalwart|$MANUAL_NEW|/usr/local/bin/stalwart|stalwart|json"
+          fi
+          if [ -n "$MANUAL_OLD" ]; then
+            echo "stalwartlabs/mail-server|$MANUAL_OLD|/usr/local/bin/stalwart-mail|root|toml"
+          fi
+          if [ -n "$MANUAL_NEW" ] || [ -n "$MANUAL_OLD" ]; then
             exit 0
           fi
 
@@ -64,6 +80,9 @@ jobs:
               ("stalwartlabs/mail-server", "/usr/local/bin/stalwart-mail", "root",     "toml"),
           ]
 
+          def version(tag):
+              return tuple(int(x) for x in re.findall(r"\d+", tag))
+
           for repo, binary, user, mode in REPOS:
               url = f"https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100"
               try:
@@ -75,31 +94,27 @@ jobs:
 
               tags = [r.get("name", "") for r in data.get("results", [])]
               tags = [t for t in tags if re.fullmatch(r"v?\d+\.\d+\.\d+", t)]
-              tags.sort(key=lambda t: [int(x) for x in re.findall(r"\d+", t)], reverse=True)
+              # 0.3.0 - 0.8.5 predate the enterprise licensing code entirely
+              # (no license.rs), so there is no public key to replace.
+              tags = [t for t in tags if version(t) >= (0, 9, 0)]
+              tags.sort(key=version, reverse=True)
+              if not tags:
+                  continue
 
-              # The pattern table covers every release from 0.9.0 on, so exercise
-              # the newest tag of every minor version plus the oldest tag of the
-              # line: that hits both ends of every version range in the table.
-              seen, picked = set(), []
-              for t in tags:
-                  minor = ".".join(t.lstrip("v").split(".")[:2])
-                  if minor not in seen:
-                      seen.add(minor)
-                      picked.append(t)
-              if tags and tags[-1] not in picked:
-                  picked.append(tags[-1])
-
-              for t in picked:
+              for t in (tags[0], tags[-1]):
                   print(f"{repo}|{t}|{binary}|{user}|{mode}")
           PY
 
       - name: Build and check each tag
         if: steps.discover.outputs.new_tags != ''
+        env:
+          PUB: ${{ steps.keys.outputs.pub }}
+          KEY: ${{ steps.keys.outputs.key }}
         run: |
           set -uo pipefail
           mapfile -t TAGS <<< "${{ steps.discover.outputs.new_tags }}"
 
-          OK=""; FAILED=""; UNSUPPORTED=""
+          OK=""; FAILED=""
 
           for ENTRY in "${TAGS[@]}"; do
             [ -z "$ENTRY" ] && continue
@@ -108,37 +123,38 @@ jobs:
             echo "=== ${REPO}:${TAG} (binary=${BINARY}, user=${USER}, mode=${MODE}) ==="
 
             if ! docker build \
+                   --build-arg LICENSE_PUBKEY="${PUB}" \
                    --build-arg STALWART_IMAGE="${REPO}:${TAG}" \
                    --build-arg STALWART_BINARY="${BINARY}" \
                    --build-arg STALWART_USER="${USER}" \
                    -t "${LOCAL}" . ; then
-              # The table covers every release from 0.9.0 on, so a failure here
-              # means the patch did not match this build - a pattern regression,
-              # not "not supported yet".
-              echo "Patch did not apply to ${REPO}:${TAG}: no version matched this binary"
-              UNSUPPORTED="${UNSUPPORTED}${UNSUPPORTED:+, }${REPO}:${TAG}"
+              # patch.sh reports exit 7 when it finds no licence public key at
+              # all, which is the honest answer for a build without the
+              # enterprise code (or if upstream changed how the key is stored).
+              FAILED="${FAILED}${FAILED:+, }${REPO}:${TAG} (patch.sh did not apply)"
               continue
             fi
 
-            if bash .github/patch-check.sh "${LOCAL}" "${BINARY}" "${MODE}"; then
+            # The original image is passed as the control: the same license must
+            # be rejected there, otherwise the acceptance check would be vacuous.
+            if bash .github/patch-check.sh "${LOCAL}" "${BINARY}" "${MODE}" \
+                   "${REPO}:${TAG}" "${KEY}"; then
               OK="${OK}${OK:+, }${REPO}:${TAG}"
             else
               FAILED="${FAILED}${FAILED:+, }${REPO}:${TAG}"
             fi
           done
 
-          echo "ok=${OK}" >> "$GITHUB_OUTPUT"
+          echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "failed=${FAILED}" >> "$GITHUB_OUTPUT"
-          echo "unsupported=${UNSUPPORTED}" >> "$GITHUB_OUTPUT"
 
-          echo "checked ok:   ${OK:-none}"
-          echo "unsupported:  ${UNSUPPORTED:-none}"
-          echo "FAILED:       ${FAILED:-none}"
+          echo "checked ok: ${OK:-none}"
+          echo "FAILED:     ${FAILED:-none}"
           [ -z "$FAILED" ] || exit 1
 
-  # Pull requests: patch and check the tag the patterns were derived from, for
-  # both product lines. The 0.11.x check additionally asserts that the patched
-  # server accepts a generated license key at runtime.
+  # Pull requests: patch and check both product lines, and assert that the
+  # patched 0.11.x server accepts a license signed with the matching key at
+  # runtime (its key lives in a plain TOML config, so the flow is scriptable).
   pr-check:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -148,29 +164,50 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Build and check the 0.16.x image
+      - name: Generate a signing key pair
+        id: keys
         run: |
           set -euo pipefail
-          IFS='|' read -r REPO BINARY USER MODE <<< "$VARIANT_016"
-          docker build --build-arg STALWART_IMAGE="${REPO}:v0.16.23" \
+          KEY="$RUNNER_TEMP/signing.key"
+          PUB=$(./generate-license.sh --pubkey-only --key "$KEY" --quiet)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "pub=$PUB"  >> "$GITHUB_OUTPUT"
+
+      - name: Build and check the 0.16.x image
+        env:
+          PUB: ${{ steps.keys.outputs.pub }}
+          KEY: ${{ steps.keys.outputs.key }}
+        run: |
+          set -euo pipefail
+          IFS='|' read -r BINARY USER MODE <<< "$VARIANT_NEW"
+          docker build --build-arg LICENSE_PUBKEY="${PUB}" \
+            --build-arg STALWART_IMAGE="stalwartlabs/stalwart:v0.16.23" \
             --build-arg STALWART_BINARY="${BINARY}" \
-            --build-arg STALWART_USER="${USER}" -t sw-test:pr016 .
-          bash .github/patch-check.sh sw-test:pr016 "${BINARY}" "${MODE}"
+            --build-arg STALWART_USER="${USER}" -t sw-test:pr016 . >/dev/null
+          bash .github/patch-check.sh sw-test:pr016 "${BINARY}" "${MODE}" "" "${KEY}"
 
       - name: Build and check the 0.11.x image (includes runtime license check)
+        env:
+          PUB: ${{ steps.keys.outputs.pub }}
+          KEY: ${{ steps.keys.outputs.key }}
         run: |
           set -euo pipefail
-          IFS='|' read -r REPO BINARY USER MODE <<< "$VARIANT_011"
-          docker build --build-arg STALWART_IMAGE="${REPO}:v0.11.8" \
+          IFS='|' read -r BINARY USER MODE <<< "$VARIANT_OLD"
+          docker build --build-arg LICENSE_PUBKEY="${PUB}" \
+            --build-arg STALWART_IMAGE="stalwartlabs/mail-server:v0.11.8" \
             --build-arg STALWART_BINARY="${BINARY}" \
-            --build-arg STALWART_USER="${USER}" -t sw-test:pr011 .
-          bash .github/patch-check.sh sw-test:pr011 "${BINARY}" "${MODE}"
+            --build-arg STALWART_USER="${USER}" -t sw-test:pr011 . >/dev/null
+          bash .github/patch-check.sh sw-test:pr011 "${BINARY}" "${MODE}" \
+            "stalwartlabs/mail-server:v0.11.8" "${KEY}"
 
-      - name: Verify the license generator still round-trips
+      - name: Verify the license generator round-trips
+        env:
+          KEY: ${{ steps.keys.outputs.key }}
         run: |
           set -euo pipefail
-          KEY=$(./generate-license.sh --domain example.com --accounts 500 --quiet)
-          python3 - "$KEY" <<'PY'
+          LICENSE=$(./generate-license.sh --domain example.com --accounts 500 --key "${KEY}" --quiet)
+          PUB="${{ steps.keys.outputs.pub }}"
+          python3 - "$LICENSE" <<'PY'
           import base64, struct, sys, time
           raw = base64.b64decode(sys.argv[1])
           vf, vt, acc, dl = struct.unpack_from('<QQII', raw, 0)
@@ -181,15 +218,24 @@ jobs:
           assert vf < vt and vf != 0 and vt != 0, (vf, vt)
           now = int(time.time())
           assert not (now >= vt or now < vf), 'key is already expired'
-          assert len(sig) > 0, 'empty signature'
-          print('license round-trip OK')
+          assert len(sig) == 64, f'signature is {len(sig)} bytes, expected 64'
+          open('/tmp/payload.bin', 'wb').write(raw[:24+dl])
+          open('/tmp/sig.bin', 'wb').write(sig)
+          print('license layout OK')
           PY
+          # The signature must verify against the public key the binary carries.
+          openssl pkey -in "${KEY}" -pubout -out /tmp/pub.pem
+          openssl pkeyutl -verify -pubin -inkey /tmp/pub.pem -rawin \
+            -in /tmp/payload.bin -sigfile /tmp/sig.bin
+          echo "license signature verifies"
 
       - name: Verify a second patch run is idempotent on both binaries
+        env:
+          PUB: ${{ steps.keys.outputs.pub }}
         run: |
           set -uo pipefail
-          IFS='|' read -r _ B16 _ _ <<< "$VARIANT_016"
-          IFS='|' read -r _ B11 _ _ <<< "$VARIANT_011"
+          IFS='|' read -r B16 _ _ <<< "$VARIANT_NEW"
+          IFS='|' read -r B11 _ _ <<< "$VARIANT_OLD"
 
           check_idem() {
             local image="$1" binary="$2" cid code
@@ -197,7 +243,7 @@ jobs:
             docker cp "$cid":"$binary" /tmp/sw-patched
             docker rm "$cid" >/dev/null
             set +e
-            bash patch.sh --quiet /tmp/sw-patched
+            bash patch.sh --quiet --pubkey "${PUB}" /tmp/sw-patched
             code=$?
             set -e
             [ "$code" = "6" ] || { echo "ERROR: $binary expected exit 6 (already patched), got $code"; exit 1; }

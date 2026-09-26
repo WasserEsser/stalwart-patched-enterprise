@@ -1,761 +1,255 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+#
+# Stalwart Enterprise license: swap the embedded Ed25519 public key.
+#
+# Every Stalwart release from 0.9.0 to 0.16.23 (x86-64 and aarch64, both image
+# repos) embeds the same 32-byte Ed25519 public key that licence signatures are
+# verified against. It appears exactly twice: as two 16-byte constants in
+# .rodata, one copy of each, in every build checked.
+#
+# Replacing those 32 bytes with a key you hold makes the binary validate a
+# licence *you* signed, using its own verifier, untouched. No code is modified,
+# so nothing is bypassed: the signature really is checked. Compare with patching
+# the branch at each licence site, which needs a separate pattern per release
+# (and a re-derivation whenever the code layout moves).
+#
+# Usage: patch.sh --pubkey <hex|file> [--dry-run] [--quiet] <binary>
+#
+# Exit codes:
+#   0   patched (or would be, with --dry-run)
+#   1   general error
+#   2   missing dependency
+#   3   no binary given
+#   4   binary not found
+#   5   binary not writable
+#   6   already patched
+#   7   no licence public key found (not an Enterprise build?)
+#   8   inconsistent: only one of the two key halves is present
+#   9   failed to write the patch
+#  10   patched bytes did not verify on read-back
+set -uo pipefail
 
-# CLI options
-QUIET=0
+# The vendor's public key, as compiled into LicenseValidator::new()
+# (license.rs: vec![118, 10, 182, 35, ...]). Masking: read as two 16-byte halves.
+# Bytes 1 and 12 of the halves are 0x0a, which is why the search is newline-safe.
+VENDOR_HALF_A=760ab623596f0b3c9a2fcd7f6be53768
+VENDOR_HALF_B=48368d0e61db0204778f9c0a98d820c2
+
 DRY_RUN=0
+QUIET=0
+PUBKEY=""
 BINARY_FILE=""
 
-# Help text
+log() {
+    [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"
+}
+
 show_help() {
-    cat << EOF
-Usage: $0 [OPTIONS] <binary_file>
+    cat << 'EOF'
+Usage: patch.sh --pubkey <hex|file> [OPTIONS] <binary>
 
-Patches the Stalwart Mail Server binary to bypass Enterprise license
-signature validation.
-
-Stalwart validates Enterprise licenses offline: the base64 license key is
-parsed and its Ed25519 signature is checked against a public key embedded in
-the binary. The verification result is a Rust Result whose discriminant is
-tested with a conditional jump, and the fall-through path raises
-LicenseError::Validation. Rewriting that test to "xor eax, eax" makes the
-conditional always take the valid-signature path, so the signature check
-always succeeds. The license key itself (valid_from/valid_to/accounts/domain)
-is still parsed and enforced normally, so you still need a well-formed key
-issued for your own domain -- see generate-license.sh.
-
-Unlike Mattermost, one Stalwart binary contains FOUR inlined copies of the
-validator (LicenseKey::new is inlined into its call sites), so every copy has
-to be patched. The patterns are listed per version and every pattern of a
-version must match exactly once.
-
-Supported: Stalwart 0.16.x (stalwartlabs/stalwart, binary "stalwart") and
-Stalwart Mail Server 0.11.x (stalwartlabs/mail-server, binary "stalwart-mail"),
-x86-64 only so far. Run with --list to see all versions.
-
-The architecture (x86-64 / ARM64) is detected from the ELF header.
+Replaces the Ed25519 public key that a Stalwart binary verifies Enterprise
+license keys against, so that keys signed with your own private key are
+accepted. The binary's own verifier is left untouched.
 
 Options:
-  -h, --help     Show this help message and exit
-  -q, --quiet    Suppress non-error output
-  --dry-run      Show what would be patched without making changes
-  --list         List supported Stalwart versions and exit
+  -p, --pubkey <hex|file>  Your Ed25519 public key: 64 hex chars, or a file
+                           containing them. generate-license.sh --pubkey-only
+                           prints it. A PEM file is not accepted; use
+                           --pubkey-only to get the raw hex.
+      --dry-run            Report what would change; write nothing
+  -q, --quiet              Suppress informational output
+  -h, --help               Show this help
 
-Exit codes:
-  0  Success
-  1  General error
-  2  Missing dependencies
-  3  No binary file specified
-  4  File does not exist
-  5  No write permission
-  6  Already patched
-  7  Pattern not found (unsupported version)
-  8  Invalid offset calculated
-  9  Failed to write patch
-  10 Patch verification failed
-  11 Not an ELF binary
-  12 Unsupported architecture
+Exit codes: 0 patched, 3 no binary, 4 not found, 5 not writable,
+            6 already patched, 7 no licence key found, 8 only one half present,
+            9 write failed, 10 read-back mismatch
 
+Example:
+  ./patch.sh --pubkey "$(./generate-license.sh --pubkey-only)" ./stalwart
 EOF
 }
 
-# Pattern table: "versions|sites|pattern|offset|replacement"
-#   versions    Human-readable list of Stalwart versions this pattern covers
-#   sites       Total number of validator sites that must be patched for this
-#               version (sum of the matches of all of its patterns)
-#   pattern     Hex bytes of the license check, "??" = any single byte
-#   offset      Byte offset into the pattern of the byte to modify
-#   replacement Hex value to write at that byte
-#
-# Every pattern of a version is applied together. A single pattern legitimately
-# matches more than once (once per inlined copy of the validator), so instead
-# of requiring "exactly once" the total number of matches (intact + already
-# patched) across the version's patterns must equal `sites`; otherwise the
-# version is considered unsupported and nothing is written. The call's
-# relative displacement is wildcarded so the pattern survives unrelated code
-# shifts.
-#
-# The check is the inlined body of:
-#     self.public_key.verify(&key[..payload_len], signature)
-#         .map_err(|_| LicenseError::Validation)?;
-# verify returns a Result<(), _> whose discriminant lands in al (0 = Ok, i.e.
-# the signature is valid), so the compiler emits
-#     call <verify> ; test al, al ; je <valid path>
-# with the fall-through path materialising LicenseError::Validation. Patching
-# the test into "xor eax, eax" (84 C0 -> 31 C0) forces ZF=1, so the je always
-# takes the valid-signature path: the signature check always succeeds, for a
-# genuine signature and a forged one alike. This is deliberately used instead
-# of inverting the branch (74 -> 75 / 0F 84 -> 0F 85), which would accept only
-# *invalid* signatures and reject a real license by sending it down the
-# LicenseError::Validation path.
-#
-# The argument-loading sequence in front of the call is what distinguishes
-# these sites from the other Ed25519 verifications in the binary (DKIM et al),
-# which share the same callee but never load the 32-byte license public key:
-#   * 0.16.23 - 48 89 DE (mov rsi, rbx) / 48 8B 74 24 38 (mov rsi,[rsp+0x38])
-#   * 0.11.8  - 48 8B 74 24 xx (mov rsi,[rsp+disp8]) /
-#               48 8B B4 24 xx xx xx xx (mov rsi,[rsp+disp32])
-# All of them load the key with "mov edx, 0x20" (BA 20 00 00 00) immediately
-# before, which pins the 32-byte public key as the verification input.
-#
-# Note on cross-version overlap: the 0.11.8 disp8 pattern is a suffix of the
-# 0.16.23 disp8 pattern, so it also matches the two 0.16.23 disp8 sites. That
-# is harmless -- version selection compares each version's total match count
-# (intact + already patched) against that version's own declared site count, so
-# for a 0.16.23 binary the 0.11.8 group only reaches 2 of its 4 required sites
-# and is discarded. Only the correct version can ever be selected.
-#
-# Stalwart 0.16.23, x86-64, virtual addresses of the patched test bytes:
-#   0x14b9af0  LicenseKey::new (inlined into Enterprise::parse)
-#   0x2429be8  LicenseKey::new (second inlining)
-#   0x4842930  LicenseKey::new (third inlining)
-#   0x4843798  LicenseKey::new (fourth inlining)
-#
-# Stalwart 0.11.8, x86-64, virtual addresses of the patched test bytes:
-#   0x1949286  LicenseKey::new (inlined)
-#   0x194d34b  LicenseKey::new (second inlining, short branch)
-#   0x272abd7  LicenseKey::new (third inlining)
-#   0x2737004  LicenseKey::new (fourth inlining)
-PATTERNS_X86_64=(
-# Pattern table: "versions|sites|pattern|offset|replacement"
-#
-# Derived from every published release binary (0.9.0 - 0.16.23: 64 builds across
-# stalwartlabs/mail-server and stalwartlabs/stalwart), not written by hand.
-#
-#   versions    One or more version labels. A label covers a release when its
-#               bytes are identical, so runs of releases collapse into ranges
-#               ("0.16.14-0.16.23") or comma lists ("0.11.2-0.11.4,0.11.6").
-#   sites       Total number of validator sites for that label. The sum of the
-#               matches of the label's patterns (intact + already patched) must
-#               equal this number; the script refuses to guess otherwise.
-#   pattern     Hex bytes. `??` and a literal `0a` are wildcards. Each site is
-#               `call <verify> ; test al, al ; jcc`, and the pattern carries the
-#               argument setup before the call plus the first 8 bytes of the
-#               fall-through. That trailing context matters: the licence check
-#               and the sibling call that verifies with the same key share the
-#               argument setup, so a pattern stopping at the branch matches
-#               both.
-#   offset      Index of the 0x84 byte of `test al, al` inside the pattern.
-#   replacement 0x31, turning `test al, al` into `xor eax, eax`.
-#
-# The replacement forces the zero flag, so the following conditional jump takes
-# the signature-valid path. The branch is deliberately NOT inverted: an inverted
-# `je` would accept only *invalid* signatures and reject a genuine licence key.
-#
-# Sites are inlined copies of the Ed25519 signature check, all calling one
-# verify routine, so the Ed25519 public key embedded in the binary separates
-# them from the other Ed25519 users (DKIM, etc.) during derivation.
-"0.9.0|1|3D D5 B8 A4 01 BA 20 00 00 00 4C 89 FE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.9.1|1|3D ED A8 A8 01 BA 20 00 00 00 4C 89 FE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.9.2|2|3D 45 CE 6B 02 BA 20 00 00 00 4C 89 EE E8 ?? ?? 0a ?? 84 C0 0F 84 ?? ?? ?? ?? 4D 8D 66 03 EB 44 48 8B|18|31"
-"0.9.2|2|3D C9 0F AE 01 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 4D 8D 66 03 48 8B 74 24|18|31"
-"0.9.3|1|3D DB BF AD 01 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8D 6E 03 48 8B 74 24|18|31"
-"0.9.4|2|3D A7 D4 71 02 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8D 6E 03 48 8B B4 24|18|31"
-"0.9.4|2|3D A1 FB AE 01 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8D 4E 03 48 85 DB 74|18|31"
-"0.10.0|2|8B 02 BA 20 00 00 00 4C 89 E6 49 89 D8 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.10.0|2|BA 01 BA 20 00 00 00 4C 89 E6 4C 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.10.1|2|92 02 BA 20 00 00 00 4C 89 E6 49 89 D8 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.10.1|2|BA 01 BA 20 00 00 00 4C 89 E6 4C 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.10.2|2|97 02 BA 20 00 00 00 4C 89 E6 49 89 E8 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.10.2|2|BA 01 BA 20 00 00 00 4C 89 E6 4C 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.10.3-0.10.5|2|?? ?? BA 20 00 00 00 4C 89 E6 ?? 89 ?? E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.10.6|4|A4 02 BA 20 00 00 00 4C 89 EE 48 89 E9 E8 ?? ?? ?? ?? 84 C0 48 8B ?? ?? ?? ?? 00 00 0F 84 8E 26 00 00|18|31"
-"0.10.6|4|BA 20 00 00 00 48 8B 74 24 20 4D 89 E8 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 8D 45 04 48 89 44 24|18|31"
-"0.10.6|4|3D F4 22 BD 01 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.10.6|4|8C BC 01 BA 20 00 00 00 48 8B 74 24 58 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 83 C6 04 48 8B 74 24|18|31"
-"0.10.7|3|BA 20 00 00 00 48 8B B4 24 80 00 00 00 E8 ?? ?? ?? ?? 84 C0 74 ?? 49 8D 4D 04 48 8B B4 24|18|31"
-"0.10.7|3|3D BC DB C4 01 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.10.7|3|45 C4 01 BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.0|4|3D FB 27 05 02 BA 20 00 00 00 48 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8D 47 04 48 89 44 24|18|31"
-"0.11.0|4|E9 04 02 BA 20 00 00 00 48 8B 74 24 78 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 03 00 00 00 00 00|18|31"
-"0.11.0|4|3D 35 4D 55 01 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.0|4|A2 4A 01 BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.1|4|3D EB 75 91 02 BA 20 00 00 00 48 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8D 47 04 48 89 44 24|18|31"
-"0.11.1|4|37 91 02 BA 20 00 00 00 48 8B 74 24 78 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 03 00 00 00 00 00|18|31"
-"0.11.1|4|3D F5 49 A0 01 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.1|4|95 9F 01 BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.2|4|3D 5E FB 04 02 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8D 47 04 48 89 44 24|18|31"
-"0.11.2|4|BC 04 02 BA 20 00 00 00 48 8B 74 24 78 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 03 00 00 00 00 00|18|31"
-"0.11.2|4|3D 80 74 78 01 BA 20 00 00 00 4C 89 E6 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.2|4|07 5F 01 BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.3|4|3D 4D CF 94 02 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8D 47 04 48 89 44 24|18|31"
-"0.11.3|4|90 94 02 BA 20 00 00 00 48 8B 74 24 78 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 03 00 00 00 00 00|18|31"
-"0.11.3|4|3D 2B 89 B9 01 BA 20 00 00 00 4C 89 E6 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.3|4|D5 B8 01 BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.4|4|3D 02 A9 94 02 BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8D 47 04 48 89 44 24|18|31"
-"0.11.4|4|69 94 02 BA 20 00 00 00 48 8B 74 24 78 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 03 00 00 00 00 00|18|31"
-"0.11.4|4|3D 50 8A BA 01 BA 20 00 00 00 4C 89 E6 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.4|4|D5 B9 01 BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.6|4|3D 9B 9C F8 FE BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8D 47 04 48 89 44 24|18|31"
-"0.11.6|4|5D F8 FE BA 20 00 00 00 48 8B 74 24 78 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 03 00 00 00 00 00|18|31"
-"0.11.6|4|3D 49 47 17 FE BA 20 00 00 00 4C 89 E6 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.6|4|8D 16 FE BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.7|4|1B FD FE BA 20 00 00 00 48 8B 74 24 20 E8 ?? ?? ?? ?? 84 C0 48 ?? 03 00 00 00 00 00 00 80|18|31"
-"0.11.7|4|CA 1E FE BA 20 00 00 00 48 8B 74 24 48 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.7|4|3D ?? ?? ?? FE BA 20 00 00 00 ?? 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.8|4|6E FB FE BA 20 00 00 00 48 8B 74 24 20 E8 ?? ?? ?? ?? 84 C0 48 ?? 03 00 00 00 00 00 00 80|18|31"
-"0.11.8|4|BA 20 00 00 00 48 8B B4 24 A0 00 00 00 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.11.8|4|?? ?? FE BA 20 00 00 00 48 8B 74 24 ?? E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.0|3|B7 FE BA 20 00 00 00 4C 89 FE 48 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.0|3|3D 05 34 57 FD BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.0|3|94 56 FD BA 20 00 00 00 48 8B 74 24 50 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.1|3|B7 FE BA 20 00 00 00 4C 89 FE 48 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.1|3|3D 65 60 56 FD BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.1|3|C1 55 FD BA 20 00 00 00 48 8B 74 24 50 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.2|3|B7 FE BA 20 00 00 00 4C 89 FE 48 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.2|3|3D E5 C4 55 FD BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.2|3|22 55 FD BA 20 00 00 00 48 8B 74 24 50 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.3|3|B5 FE BA 20 00 00 00 4C 89 FE 48 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.3|3|3D 35 A4 53 FD BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.3|3|00 53 FD BA 20 00 00 00 48 8B 74 24 50 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.4|3|B6 FE BA 20 00 00 00 4C 89 FE 48 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.4|3|3D 4A 1B 54 FD BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.4|3|7A 53 FD BA 20 00 00 00 48 8B 74 24 50 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.5|3|B1 FE BA 20 00 00 00 48 89 EE 48 89 D9 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.5|3|3D C3 98 47 FD BA 20 00 00 00 4C 89 FE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.12.5|3|F9 3E FD BA 20 00 00 00 48 8B 74 24 38 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.0|3|5A B2 FE BA 20 00 00 00 48 8B 74 24 38 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.0|3|3D 93 87 48 FD BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.0|3|F5 3F FD BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.1|3|AE B1 FE BA 20 00 00 00 48 8B 74 24 38 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.1|3|3D AB 2E 48 FD BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.1|3|92 3F FD BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.2|3|A9 B1 FE BA 20 00 00 00 48 8B 74 24 38 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.2|3|3D 6B E2 48 FD BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.2|3|60 40 FD BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.3|3|11 B2 FE BA 20 00 00 00 48 8B 74 24 30 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.3|3|3D 65 CE 44 FD BA 20 00 00 00 4C 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.3|3|8C 3C FD BA 20 00 00 00 48 8B 74 24 50 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.4|4|AD FE BA 20 00 00 00 4C 89 FE 4C 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.4|4|3D 27 B9 3A FD BA 20 00 00 00 4C 89 FE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.13.4|4|?? ?? ?? BA 20 00 00 00 48 8B 74 24 ?? E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.14.0|4|9E FE BA 20 00 00 00 4C 89 FE 4C 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.14.0|4|3D C0 6B 12 FD BA 20 00 00 00 4C 89 FE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.14.0|4|?? 0a ?? BA 20 00 00 00 48 8B 74 24 ?? E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.14.1|4|9E FE BA 20 00 00 00 4C 89 FE 4C 89 E9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.14.1|4|3D C0 15 12 FD BA 20 00 00 00 4C 89 FE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.14.1|4|?? ?? ?? BA 20 00 00 00 48 8B 74 24 ?? E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.15.0-0.15.4|4|?? ?? BA 20 00 00 00 4C 89 FE 4C 89 E1 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.15.0-0.15.4|4|?? ?? ?? BA 20 00 00 00 48 8B 74 24 ?? E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.15.5|4|BA 20 00 00 00 48 8B 74 24 20 49 89 D8 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.15.5|4|3D C9 39 93 FE BA 20 00 00 00 48 89 EE E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.15.5|4|DD FC BA 20 00 00 00 4C 89 FE 4C 89 E1 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.15.5|4|48 8B B4 24 88 00 00 00 48 8B 4C 24 28 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.16.0-0.16.12|4|BF 01 00 00 00 BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 74 ?? 48 FF C5 48 89 E8 49 89|18|31"
-"0.16.0-0.16.12|4|BF 01 00 00 00 BA 20 00 00 00 4C 89 D6 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 00 00 00 00 00 00|18|31"
-"0.16.13|4|BF 01 00 00 00 BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 03 00 00 00 00 00|18|31"
-"0.16.13|4|00 00 00 BA 20 00 00 00 48 8B 74 24 40 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 03 00 00 00 00 00|18|31"
-"0.16.14-0.16.23|4|BF 01 00 00 00 BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 74 ?? 48 B8 03 00 00 00 00 00|18|31"
-"0.16.14-0.16.23|4|00 00 00 BA 20 00 00 00 48 8B 74 24 38 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 48 B8 03 00 00 00 00 00|18|31"
-)
-
-# ARM64 (aarch64) patterns. The check is a compare-and-branch on the returned
-# discriminant right after the call; ARM64 is little-endian, so the opcode's
-# high byte is the LAST byte of the 4-byte instruction (cbz/ldrb style branch
-# bytes are inverted the same way as on x86-64).
-PATTERNS_ARM64=(
-)
-
-# Sanity anchors: the 32 bytes of the embedded Ed25519 license public key,
-# stored as two separate 16-byte .rodata constants. These are version-stable
-# constants, so finding them confirms the binary really is an Enterprise build
-# with this validation code in it. Informational only.
-PUBKEY_ANCHORS=(
-    "pubkey[0..16]|76 0A B6 23 59 6F 0B 3C 9A 2F CD 7F 6B E5 37 68"
-    "pubkey[16..32]|48 36 8D 0E 61 DB 02 04 77 8F 9C 0A 98 D8 20 C2"
-)
-
-# List supported versions (deduplicated: one line per version, not per pattern)
-list_versions() {
-    local seen=() entry v s skip
-    echo "Supported Stalwart versions:"
-    echo "x86-64:"
-    if [ ${#PATTERNS_X86_64[@]} -eq 0 ]; then
-        echo "  (none yet)"
-    else
-        for entry in "${PATTERNS_X86_64[@]}"; do
-            v=$(echo "$entry" | cut -d'|' -f1)
-            skip=0
-            for s in ${seen[@]+"${seen[@]}"}; do
-                [ "$s" = "$v" ] && skip=1
-            done
-            [ "$skip" -eq 1 ] && continue
-            seen+=("$v")
-            echo "  - $v ($(echo "$entry" | cut -d'|' -f2) sites)"
-        done
-    fi
-    seen=()
-    echo "ARM64 (aarch64):"
-    if [ ${#PATTERNS_ARM64[@]} -eq 0 ]; then
-        echo "  (none yet)"
-    else
-        for entry in "${PATTERNS_ARM64[@]}"; do
-            v=$(echo "$entry" | cut -d'|' -f1)
-            skip=0
-            for s in ${seen[@]+"${seen[@]}"}; do
-                [ "$s" = "$v" ] && skip=1
-            done
-            [ "$skip" -eq 1 ] && continue
-            seen+=("$v")
-            echo "  - $v ($(echo "$entry" | cut -d'|' -f2) sites)"
-        done
-    fi
-}
-
-# Parse arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        -q|--quiet)
-            QUIET=1
-            shift
-            ;;
-        --dry-run)
-            DRY_RUN=1
-            shift
-            ;;
-        --list)
-            list_versions
-            exit 0
-            ;;
-        -*)
-            echo "Error: Unknown option: $1" >&2
-            echo "Use '$0 --help' for usage information." >&2
-            exit 1
-            ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--pubkey) PUBKEY="${2:-}"; shift 2 ;;
+        --dry-run)   DRY_RUN=1; shift ;;
+        -q|--quiet)  QUIET=1; shift ;;
+        -h|--help)   show_help; exit 0 ;;
+        -*)          echo "Error: unknown option '$1'" >&2; show_help >&2; exit 1 ;;
         *)
-            if [ -z "$BINARY_FILE" ]; then
-                BINARY_FILE="$1"
-            else
-                echo "Error: Multiple binary files specified." >&2
+            if [ -n "$BINARY_FILE" ]; then
+                echo "Error: more than one binary given." >&2
                 exit 1
             fi
-            shift
-            ;;
+            BINARY_FILE="$1"; shift ;;
     esac
 done
 
-# Helper for conditional output
-log() {
-    if [ "$QUIET" -eq 0 ]; then
-        echo "$@"
-    fi
-}
-
-# Build a PCRE byte pattern from the hex pattern ("??" -> any byte)
-# Note: grep -P treats a literal 0x0a (newline) byte in the pattern as a line
-# terminator, which would make such patterns unmatchable. We therefore emit a
-# wildcard for any fixed 0x0a byte; the surrounding context keeps the pattern
-# specific enough.
-# Usage: hex_to_pcre <hex_pattern>
-hex_to_pcre() {
-    local pattern="$1" token out="" lower
-    for token in $pattern; do
-        if [ "$token" = "??" ]; then
-            out+='[\x00-\xff]'
-        else
-            lower=$(echo "$token" | LC_ALL=C tr 'A-F' 'a-f')
-            if [ "$lower" = "0a" ]; then
-                out+='[\x00-\xff]'
-            else
-                out+="\\x$lower"
-            fi
-        fi
-    done
-    echo "$out"
-}
-
-# Build a plain regex from the hex pattern for the hexdump fallback.
-# Each "??" becomes "." (one hex char pair = one byte).
-# Usage: hex_to_regex <hex_pattern>
-hex_to_regex() {
-    local pattern="$1" token out=""
-    for token in $pattern; do
-        if [ "$token" = "??" ]; then
-            out+='..'
-        else
-            out+="$(echo "$token" | LC_ALL=C tr 'A-F' 'a-f')"
-        fi
-    done
-    echo "$out"
-}
-
-# Replace the byte at a given offset inside a hex pattern
-# Usage: pattern_set_byte <hex_pattern> <offset> <value>
-pattern_set_byte() {
-    local pattern="$1" offset="$2" value="$3"
-    local tokens=() i=0
-    for token in $pattern; do
-        tokens+=("$token")
-    done
-    tokens[$offset]="$value"
-    echo "${tokens[*]}"
-}
-
-# Get the byte at a given offset inside a hex pattern
-# Usage: pattern_get_byte <hex_pattern> <offset>
-pattern_get_byte() {
-    local pattern="$1" offset="$2"
-    local tokens=() token
-    for token in $pattern; do
-        tokens+=("$token")
-    done
-    echo "${tokens[$offset]}"
-}
-
-# Setup cleanup for temp files
-TEMP_FILE=""
-cleanup() {
-    if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
-        rm -f "$TEMP_FILE"
-    fi
-}
-trap cleanup EXIT
-
-# Check for required dependencies
-DEPENDENCIES=(xxd grep awk dd tr mktemp file fold)
-MISSING_DEPS=()
-
-for dep in "${DEPENDENCIES[@]}"; do
-    if ! command -v "$dep" >/dev/null 2>&1; then
-        MISSING_DEPS+=("$dep")
-    fi
+for dep in tr grep dd xxd mktemp; do
+    command -v "$dep" >/dev/null 2>&1 || {
+        echo "Error: required command '$dep' is not installed." >&2
+        exit 2
+    }
 done
 
-if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
-    echo "Error: The following required commands are not installed:"
-    for dep in "${MISSING_DEPS[@]}"; do
-        echo "  - $dep"
-    done
-    echo "Please install them and try again."
-    exit 2
-fi
-
-# Check if grep supports PCRE (-P). BusyBox grep does not.
-if echo "x" | grep -qP "x" 2>/dev/null; then
-    HAVE_PCRE=1
-else
-    HAVE_PCRE=0
-    log "Warning: grep does not support -P (PCRE). Falling back to hexdump method (slower)."
-    if ! command -v hexdump >/dev/null 2>&1; then
-        echo "Error: grep without -P support requires hexdump, which is not installed." >&2
-        exit 2
-    fi
-fi
-
-# Check binary file argument exists and is writable
 if [ -z "$BINARY_FILE" ]; then
-    echo "Error: No binary file specified." >&2
+    echo "Error: no binary given." >&2
     show_help >&2
     exit 3
 fi
+[ -f "$BINARY_FILE" ] || { echo "Error: '$BINARY_FILE' does not exist." >&2; exit 4; }
+[ -w "$BINARY_FILE" ] || { echo "Error: no write permission for '$BINARY_FILE'." >&2; exit 5; }
 
-if [ ! -f "$BINARY_FILE" ]; then
-    echo "Error: File '$BINARY_FILE' does not exist." >&2
-    exit 4
-fi
-
-if [ ! -w "$BINARY_FILE" ]; then
-    echo "Error: No write permission for '$BINARY_FILE'." >&2
-    exit 5
-fi
-
-# Check if file is an ELF binary
-FILE_TYPE=$(file -bL "$BINARY_FILE") || {
-    echo "Error: Unable to determine file type for '$BINARY_FILE'." >&2
+# --- our public key -> two 16-byte halves -----------------------------------
+if [ -z "$PUBKEY" ]; then
+    echo "Error: --pubkey is required (64 hex chars, or a file containing them)." >&2
+    echo "       Get it with: ./generate-license.sh --pubkey-only" >&2
     exit 1
+fi
+if [ -f "$PUBKEY" ]; then
+    PUBKEY=$(tr -d ' \t\r\n:' < "$PUBKEY")
+fi
+PUBKEY=$(printf '%s' "$PUBKEY" | tr 'A-F' 'a-f')
+case "$PUBKEY" in
+    *[!0-9a-f]*|'') echo "Error: --pubkey must be 64 hex characters." >&2; exit 1 ;;
+esac
+if [ "${#PUBKEY}" -ne 64 ]; then
+    echo "Error: --pubkey must be exactly 64 hex characters (32 bytes); got ${#PUBKEY}." >&2
+    exit 1
+fi
+if [ "$PUBKEY" = "${VENDOR_HALF_A}${VENDOR_HALF_B}" ]; then
+    echo "Error: that is the vendor's public key; supply your own." >&2
+    exit 1
+fi
+OUR_HALF_A="${PUBKEY:0:32}"
+OUR_HALF_B="${PUBKEY:32:32}"
+
+TMP=""
+cleanup() { [ -n "$TMP" ] && rm -f "$TMP"; }
+trap cleanup EXIT
+
+# --- newline-safe search ----------------------------------------------------
+# grep matches line by line and both halves contain 0x0a, so the needles would
+# be unmatchable in the raw file. Flatten first: tr maps 0x0a to 0x0d
+# one-to-one, so file offsets stay valid, and the needle is translated the same
+# way. Every hit is then re-checked against the raw bytes, because a genuine
+# 0x0d in the original would otherwise masquerade as a translated 0x0a.
+TMP=$(mktemp) || { echo "Error: cannot create a temporary file." >&2; exit 1; }
+if ! tr '\n' '\r' < "$BINARY_FILE" > "$TMP"; then
+    echo "Error: failed to read '$BINARY_FILE'." >&2
+    exit 1
+fi
+
+translate_0a() {   # 0x0a -> 0x0d, byte by byte (sed would match across pairs)
+    local hex=$1 out="" i b
+    for ((i = 0; i < ${#hex}; i += 2)); do
+        b="${hex:i:2}"
+        [ "$b" = "0a" ] && b="0d"
+        out+="$b"
+    done
+    printf '%s' "$out"
 }
-if ! echo "$FILE_TYPE" | grep -q "ELF"; then
-    echo "Error: '$BINARY_FILE' does not appear to be an ELF binary (detected: $FILE_TYPE)." >&2
-    exit 11
-fi
 
-# Select the pattern table matching the binary's architecture
-if echo "$FILE_TYPE" | grep -q "x86-64"; then
-    ARCH="x86-64"
-    PATTERNS=("${PATTERNS_X86_64[@]}")
-elif echo "$FILE_TYPE" | grep -q "ARM aarch64"; then
-    ARCH="arm64"
-    PATTERNS=("${PATTERNS_ARM64[@]}")
-else
-    echo "Error: Unsupported architecture (detected: $FILE_TYPE)." >&2
-    echo "Supported architectures: x86-64 and ARM aarch64." >&2
-    exit 12
-fi
-log "Detected architecture: $ARCH"
+hex_to_pcre() {    # literal bytes, no wildcards
+    local hex=$1 out="" i
+    for ((i = 0; i < ${#hex}; i += 2)); do
+        out+="\\x${hex:i:2}"
+    done
+    printf '%s' "$out"
+}
 
-if [ ${#PATTERNS[@]} -eq 0 ]; then
-    echo "Error: No patch patterns are known for $ARCH yet." >&2
-    echo "Only x86-64 patterns have been derived so far. Please report this at:" >&2
-    echo "  https://github.com/WasserEsser/stalwart-patched-enterprise/issues" >&2
+# Prints every true file offset of the 16-byte needle $1.
+find_half() {
+    local hex=$1 flat_off raw_hex
+    LC_ALL=C grep -aboP "$(hex_to_pcre "$(translate_0a "$hex")")" "$TMP" 2>/dev/null |
+    while IFS=: read -r flat_off _; do
+        [ -n "$flat_off" ] || continue
+        raw_hex=$(dd if="$BINARY_FILE" bs=1 skip="$flat_off" count=16 2>/dev/null | xxd -p -c 16)
+        if [ "$raw_hex" = "$hex" ]; then
+            printf '%s\n' "$flat_off"
+        fi
+    done
+}
+
+mapfile -t A_OFFS < <(find_half "$VENDOR_HALF_A")
+mapfile -t B_OFFS < <(find_half "$VENDOR_HALF_B")
+mapfile -t OUR_A_OFFS < <(find_half "$OUR_HALF_A")
+mapfile -t OUR_B_OFFS < <(find_half "$OUR_HALF_B")
+
+NA=${#A_OFFS[@]}
+NB=${#B_OFFS[@]}
+NOURA=${#OUR_A_OFFS[@]}
+NOURB=${#OUR_B_OFFS[@]}
+
+# --- already patched? -------------------------------------------------------
+if [ "$NA" -eq 0 ] && [ "$NB" -eq 0 ]; then
+    if [ "$NOURA" -ge 1 ] && [ "$NOURB" -ge 1 ]; then
+        log "Already patched: this binary carries the public key you supplied."
+        log "  ($NOURA copy of the first half, $NOURB of the second)"
+        exit 6
+    fi
+    echo "Error: no Stalwart licence public key found in '$BINARY_FILE'." >&2
+    echo "       Not an Enterprise build, or the key layout changed upstream." >&2
     exit 7
 fi
-
-# Prepare a searchable copy of the binary.
-# Fast path: strip newlines (1:1 byte mapping, preserves offsets) so grep -P
-# can match byte sequences that would otherwise span line boundaries.
-TEMP_FILE=$(mktemp) || {
-    echo "Error: failed to create a temporary file (is TMPDIR writable and not full?)." >&2
-    exit 1
-}
-if [ "$HAVE_PCRE" -eq 1 ]; then
-    log "Preparing binary for search"
-    if ! tr '\n' '\r' < "$BINARY_FILE" > "$TEMP_FILE"; then
-        echo "Error: Failed to prepare '$BINARY_FILE' for search (unreadable file, or no space left in TMPDIR)." >&2
-        exit 1
-    fi
-else
-    log "Dumping hexcode of original binary"
-    # Fold the hexdump into lines so grep processes short lines: a single
-    # 2x-file-size line would exhaust memory on constrained systems and is
-    # orders of magnitude slower. Byte offsets stay valid because grep -b
-    # reports absolute file offsets; search_pattern() corrects for the
-    # inserted newlines.
-    if ! hexdump -ve '1/1 "%.2x"' "$BINARY_FILE" | fold -w 65536 > "$TEMP_FILE"; then
-        echo "Error: Failed to hexdump '$BINARY_FILE' (unreadable file, or no space left in TMPDIR)." >&2
-        exit 1
-    fi
+if [ "$NA" -eq 0 ] || [ "$NB" -eq 0 ]; then
+    echo "Error: found only one of the two public-key halves" >&2
+    echo "       (first half: $NA, second half: $NB) - refusing to patch a" >&2
+    echo "       binary that is in an unexpected state." >&2
+    exit 8
 fi
 
-if [ ! -s "$TEMP_FILE" ]; then
-    echo "Error: Failed to extract binary data (empty output)." >&2
-    exit 1
+log " Licence public key found in '$BINARY_FILE':"
+for off in "${A_OFFS[@]}"; do log "   first half  at file offset 0x$(printf '%x' "$off")"; done
+for off in "${B_OFFS[@]}"; do log "   second half at file offset 0x$(printf '%x' "$off")"; done
+log " Replacing with:"
+log "   $OUR_HALF_A$OUR_HALF_B"
+
+if [ "$NA" -ne 1 ] || [ "$NB" -ne 1 ]; then
+    log " Note: $NA copy/copies of the first half and $NB of the second; all are"
+    log "       replaced, so no code path keeps the vendor key."
 fi
 
-# Search a pattern in the binary.
-# Prints one "<byte_offset>" per match (byte offset into the original file).
-#
-# Patterns that contain a literal 0x0a byte are searched in the prepared
-# newline-flattened copy (grep cannot match across line boundaries). All
-# other patterns are searched in the raw binary: grep then processes short
-# lines instead of one giant line, which keeps memory usage low even for
-# huge binaries. (grep -P buffers the whole flattened line, which can
-# exhaust memory on constrained systems and fail silently.)
-#
-# Usage: search_pattern <hex_pattern> <pcre_pattern> <plain_regex> <hex_mode(0|1)>
-search_pattern() {
-    local hex_pattern="$1" pcre="$2" plain="$3" hex_mode="$4"
-    local search_file="$BINARY_FILE" result rc errf
-
-    if [ "$hex_mode" -eq 1 ] || echo "$hex_pattern" | tr ' ' '\n' | grep -qxi '0a'; then
-        search_file="$TEMP_FILE"
+# --- patch ------------------------------------------------------------------
+write_half() {   # <offset> <hex>
+    local off=$1 hex=$2 got
+    if ! printf '%s' "$hex" | xxd -r -p | dd of="$BINARY_FILE" bs=1 seek="$off" conv=notrunc >/dev/null 2>&1; then
+        echo "Error: failed to write at offset 0x$(printf '%x' "$off")." >&2
+        exit 9
     fi
-
-    errf=$(mktemp) || { echo "Error: failed to create a temporary file (is TMPDIR writable and not full?)." >&2; exit 1; }
-    if [ "$hex_mode" -eq 1 ]; then
-        # The hexdump is folded at 65536 chars per line. Unfold its offsets:
-        # true_offset = p - floor((p + 1) / 65537).
-        if result=$(LC_ALL=C grep -Eo -b "$plain" "$search_file" 2>"$errf" | LC_ALL=C awk -F: 'NF {print $1 - int(($1 + 1) / 65537)}'); then
-            rc=0
-        else
-            rc=$?
-        fi
-    else
-        # grep -o writes "<offset>:<raw match>". The match can contain NUL
-        # bytes, so extract the offset before command substitution: Bash
-        # cannot store NUL bytes and would otherwise warn while silently
-        # dropping them. (With pipefail the pipeline still reports grep's
-        # exit status, so the error handling below keeps working.)
-        if result=$(LC_ALL=C grep -aboP "$pcre" "$search_file" 2>"$errf" | LC_ALL=C awk -F: 'NF {print $1}'); then
-            rc=0
-        else
-            rc=$?
-        fi
-        # A pattern whose wildcard bytes span a literal 0x0a byte in the
-        # binary can never match in the raw file (grep cannot match across
-        # line boundaries). If the raw search found nothing, retry on the
-        # newline-flattened copy before giving up on this pattern.
-        if [ "$rc" -eq 1 ] && [ "$search_file" != "$TEMP_FILE" ]; then
-            result=$(LC_ALL=C grep -aboP "$pcre" "$TEMP_FILE" 2>"$errf" | LC_ALL=C awk -F: 'NF {print $1}'); rc=$?
-        fi
+    got=$(dd if="$BINARY_FILE" bs=1 skip="$off" count=16 2>/dev/null | xxd -p -c 16)
+    if [ "$got" != "$hex" ]; then
+        echo "Error: read-back mismatch at 0x$(printf '%x' "$off"): expected $hex, found $got" >&2
+        exit 10
     fi
-
-    if [ "$rc" -eq 2 ]; then
-        echo "Warning: grep failed on '$search_file' ($(cat "$errf")), skipping this pattern" >&2
-        result=""
-    fi
-    rm -f "$errf"
-    printf '%s\n' "$result"
 }
 
-# Sanity-check the embedded license public key. Purely informational: it
-# confirms we are looking at a Stalwart Enterprise binary.
-for anchor in "${PUBKEY_ANCHORS[@]}"; do
-    IFS='|' read -r label pattern <<< "$anchor"
-    hits=$(search_pattern "$pattern" "$(hex_to_pcre "$pattern")" "$(hex_to_regex "$pattern")" "$((1 - HAVE_PCRE))")
-    n=0
-    first=""
-    for off in $hits; do
-        n=$((n + 1))
-        [ -z "$first" ] && first="$off"
-    done
-    if [ "$n" -ge 1 ]; then
-        log "Found license public key anchor ($label) at file offset 0x$(printf '%x' "$first")"
+PATCHED=0
+for off in "${A_OFFS[@]}"; do
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "   would replace first half at 0x$(printf '%x' "$off")"
     else
-        log "Warning: license public key anchor ($label) not found - this may not be a Stalwart Enterprise binary."
+        write_half "$off" "$OUR_HALF_A"
+        log "   replaced first half at 0x$(printf '%x' "$off")"
     fi
+    PATCHED=$((PATCHED + 1))
 done
-
-log "Searching for the Enterprise license signature check"
-
-# Pass 1: count matches for every entry, in both original and patched form.
-COUNT=0
-for entry in "${PATTERNS[@]}"; do
-    IFS='|' read -r versions sites pattern offset replacement <<< "$entry"
-    patched_pattern=$(pattern_set_byte "$pattern" "$offset" "$replacement")
-
-    orig_hits=$(search_pattern "$pattern" "$(hex_to_pcre "$pattern")" "$(hex_to_regex "$pattern")" "$((1 - HAVE_PCRE))")
-    patched_hits=$(search_pattern "$patched_pattern" "$(hex_to_pcre "$patched_pattern")" "$(hex_to_regex "$patched_pattern")" "$((1 - HAVE_PCRE))")
-
-    orig_count=0
-    orig_list=""
-    for off in $orig_hits; do
-        orig_count=$((orig_count + 1))
-        orig_list="$orig_list $off"
-    done
-    patched_count=0
-    for off in $patched_hits; do
-        patched_count=$((patched_count + 1))
-    done
-
-    EV_VERSION[$COUNT]="$versions"
-    EV_SITES[$COUNT]="$sites"
-    EV_PATTERN[$COUNT]="$pattern"
-    EV_OFFSET[$COUNT]="$offset"
-    EV_REPLACEMENT[$COUNT]="$replacement"
-    EV_ORIG_COUNT[$COUNT]="$orig_count"
-    EV_ORIG_OFFSETS[$COUNT]="$orig_list"
-    EV_PATCHED_COUNT[$COUNT]="$patched_count"
-    COUNT=$((COUNT + 1))
-done
-
-# Pass 2: pick the version for which the total number of matches
-# (intact + already patched) equals the declared number of validator sites.
-FOUND_VERSION=""
-FOUND_SITES=0
-VERSIONS_SEEN=()
-for ((i = 0; i < COUNT; i++)); do
-    v="${EV_VERSION[$i]}"
-    skip=0
-    for seen in ${VERSIONS_SEEN[@]+"${VERSIONS_SEEN[@]}"}; do
-        [ "$seen" = "$v" ] && skip=1
-    done
-    [ "$skip" -eq 1 ] && continue
-    VERSIONS_SEEN+=("$v")
-
-    want="${EV_SITES[$i]}"
-    got=0
-    for ((j = 0; j < COUNT; j++)); do
-        [ "${EV_VERSION[$j]}" = "$v" ] || continue
-        got=$((got + EV_ORIG_COUNT[j] + EV_PATCHED_COUNT[j]))
-    done
-
-    if [ "$got" -eq "$want" ]; then
-        if [ -n "$FOUND_VERSION" ]; then
-            echo "Error: Both '$FOUND_VERSION' and '$v' match the binary. This is unexpected" >&2
-            echo "and could patch the wrong code. Please report this at:" >&2
-            echo "  https://github.com/WasserEsser/stalwart-patched-enterprise/issues" >&2
-            exit 1
-        fi
-        FOUND_VERSION="$v"
-        FOUND_SITES="$want"
+for off in "${B_OFFS[@]}"; do
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "   would replace second half at 0x$(printf '%x' "$off")"
+    else
+        write_half "$off" "$OUR_HALF_B"
+        log "   replaced second half at 0x$(printf '%x' "$off")"
     fi
-done
-
-if [ -z "$FOUND_VERSION" ]; then
-    echo "Call not found!" >&2
-    echo "Your Stalwart version may not be supported yet." >&2
-    echo "Supported versions:" >&2
-    for v in ${VERSIONS_SEEN[@]+"${VERSIONS_SEEN[@]}"}; do
-        [ -n "$v" ] && echo "  - $v" >&2
-    done
-    echo "If your version is not listed, update this script or report the issue at:" >&2
-    echo "  https://github.com/WasserEsser/stalwart-patched-enterprise/issues" >&2
-    exit 7
-fi
-
-log "Detected version: $FOUND_VERSION"
-
-# Collect the entries that still need patching.
-PENDING=()
-PENDING_TOTAL=0
-ALREADY=0
-for ((i = 0; i < COUNT; i++)); do
-    [ "${EV_VERSION[$i]}" = "$FOUND_VERSION" ] || continue
-    ALREADY=$((ALREADY + EV_PATCHED_COUNT[i]))
-    if [ "${EV_ORIG_COUNT[$i]}" -gt 0 ]; then
-        PENDING+=("$i")
-        PENDING_TOTAL=$((PENDING_TOTAL + EV_ORIG_COUNT[i]))
-    fi
-done
-
-if [ "$PENDING_TOTAL" -eq 0 ]; then
-    log "Binary appears to already be patched ($ALREADY/$FOUND_SITES site(s) rewritten)."
-    exit 6
-fi
-
-log "License signature check found: $FOUND_SITES site(s) total, $PENDING_TOTAL to patch, $ALREADY already patched"
-
-PATCHED_COUNT=0
-for i in "${PENDING[@]}"; do
-    pattern="${EV_PATTERN[$i]}"
-    offset="${EV_OFFSET[$i]}"
-    replacement="${EV_REPLACEMENT[$i]}"
-    ORIGINAL_BYTE=$(pattern_get_byte "$pattern" "$offset")
-    if [ "$ORIGINAL_BYTE" = "??" ]; then
-        echo "Error: Pattern offset $offset points at a wildcard byte." >&2
-        exit 8
-    fi
-
-    for FOUND_OFFSET in ${EV_ORIG_OFFSETS[$i]}; do
-        # Fast path offsets are already in bytes. Hexdump path needs /2.
-        if [ "$HAVE_PCRE" -eq 1 ]; then
-            BYTE_OFFSET=$((FOUND_OFFSET + offset))
-        else
-            BYTE_OFFSET=$((FOUND_OFFSET / 2 + offset))
-        fi
-        BYTE_OFFSET_HEX=$(printf "%x" "$BYTE_OFFSET")
-
-        if [ "$BYTE_OFFSET" -lt 0 ]; then
-            echo "Error: Calculated offset is before the start of the file!" >&2
-            exit 8
-        fi
-
-        log "  Rewriting signature check at offset 0x$BYTE_OFFSET_HEX ($ORIGINAL_BYTE -> $replacement, test al,al -> xor eax,eax)"
-
-        if [ "$DRY_RUN" -eq 1 ]; then
-            continue
-        fi
-
-        if ! printf "$replacement" | xxd -r -p | dd of="$BINARY_FILE" bs=1 seek="$BYTE_OFFSET" conv=notrunc > /dev/null 2>&1; then
-            echo "Error: Failed to write patch to '$BINARY_FILE'." >&2
-            exit 9
-        fi
-
-        # Verify the patch was applied
-        WRITTEN_BYTE=$(dd if="$BINARY_FILE" bs=1 skip="$BYTE_OFFSET" count=1 2>/dev/null | xxd -p) || {
-            echo "Error: Failed to read back patched byte at offset 0x$BYTE_OFFSET_HEX for verification." >&2
-            exit 1
-        }
-        if [ "$(echo "$WRITTEN_BYTE" | tr "A-F" "a-f")" != "$(echo "$replacement" | tr "A-F" "a-f")" ]; then
-            echo "Error: Patch verification failed! Expected '$replacement' but found '$WRITTEN_BYTE' at offset 0x$BYTE_OFFSET_HEX." >&2
-            exit 10
-        fi
-
-        PATCHED_COUNT=$((PATCHED_COUNT + 1))
-    done
+    PATCHED=$((PATCHED + 1))
 done
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    log "Dry run: would patch $PENDING_TOTAL site(s). No changes made to '$BINARY_FILE'."
+    log "Dry run: would replace $PATCHED half(es). No changes made."
     exit 0
 fi
 
-log "Licensing code patched ($PATCHED_COUNT site(s))!"
-log "Generate a license key for your own domain with generate-license.sh and set it"
-log "in the Stalwart configuration as:"
-log "  0.16.x (JSON):  \"enterprise\": { \"licenseKey\": \"<key>\" }"
-log "  0.11.x (TOML):  [enterprise] license-key = \"<key>\""
+log "Licence public key replaced ($PATCHED half(es), $((PATCHED * 16)) bytes)."
+log "The signature check itself is untouched. Sign keys with your private key:"
+log "  ./generate-license.sh --domain <registrable-domain>"
