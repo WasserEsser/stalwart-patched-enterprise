@@ -155,6 +155,11 @@ log "Accounts:   $ACCOUNTS"
 log "Valid from: $(date -d "@$VALID_FROM" -Iseconds 2>/dev/null || echo "$VALID_FROM")"
 log "Valid to:   $(date -d "@$VALID_TO" -Iseconds 2>/dev/null || echo "$VALID_TO")"
 log ""
-log "Set it as the license key in the Stalwart configuration, e.g. in"
-log "/etc/stalwart/config.json:"
-log '  { "enterprise": { "licenseKey": "<key>" }, "system": { "defaultHostname": "mail.'"$DOMAIN"'" } }'
+log "Set it as the license key in the Stalwart configuration:"
+log "  0.16.x (JSON, /etc/stalwart/config.json):"
+log '    { "enterprise": { "licenseKey": "<key>" }, "system": { "defaultHostname": "mail.'"$DOMAIN"'" } }'
+log "  0.11.x (TOML, /opt/stalwart-mail/etc/config.toml):"
+log '    [server]'
+log '    hostname = "mail.'"$DOMAIN"'"'
+log '    [enterprise]'
+log '    license-key = "<key>"'

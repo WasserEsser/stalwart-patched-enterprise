@@ -7,36 +7,59 @@ Everything below assumes `bash`, `docker` and `xxd` on the host. `:Z` on the
 `-v` flags is SELinux relabelling (needed on Fedora/RHEL) and is harmless
 elsewhere.
 
+The two product lines differ a lot in how the license is applied, so pick the
+section that matches your image:
+
+| | 0.11.x | 0.16.x |
+|---|---|---|
+| image | `stalwartlabs/mail-server` | `stalwartlabs/stalwart` |
+| binary | `/usr/local/bin/stalwart-mail` | `/usr/local/bin/stalwart` |
+| runs as | root | `stalwart` (uid 2000), needs `cap_net_bind_service` |
+| config | `/opt/stalwart-mail/etc/config.toml` (full TOML) | `/etc/stalwart/config.json` (data-store document only) |
+| license key | `[enterprise] license-key` in the TOML | registry property, set via the admin API |
+| data | `/opt/stalwart-mail/data` | `/var/lib/stalwart` |
+
 ---
 
 ## 1. Build the patched image
 
 ```bash
 git clone <this repo> && cd stalwart-patched-enterprise
-docker build -t stalwart-patched:latest .
+
+# 0.16.x
+docker build --build-arg STALWART_IMAGE=stalwartlabs/stalwart:v0.16.23 \
+  -t stalwart-patched:0.16.23 .
+
+# 0.11.x
+docker build \
+  --build-arg STALWART_IMAGE=stalwartlabs/mail-server:v0.11.8 \
+  --build-arg STALWART_BINARY=/usr/local/bin/stalwart-mail \
+  --build-arg STALWART_USER=root \
+  -t stalwart-patched:0.11.8 .
 ```
 
-Pin a version explicitly (recommended):
-
-```bash
-docker build --build-arg STALWART_IMAGE_TAG=v0.16.23 -t stalwart-patched:0.16.23 .
-```
-
-If the build fails with `Call not found!` (exit 7), the tag is a version whose
-patterns are not in the table yet — see step 6.
+Pin a version explicitly — `latest` works but moves under you. If the build
+fails with `Call not found!` (exit 7), that version's patterns are not in the
+table yet; see step 6.
 
 ## 2. Check the patch landed
 
 ```bash
-CID=$(docker create stalwart-patched:latest /bin/true)
-docker cp "$CID":/usr/local/bin/stalwart ./stalwart-patched-check
+CID=$(docker create stalwart-patched:0.11.8 /bin/true)
+docker cp "$CID":/usr/local/bin/stalwart-mail ./stalwart-check   # .16: /usr/local/bin/stalwart
 docker rm "$CID" >/dev/null
-./patch.sh ./stalwart-patched-check     # expect exit 6 (already patched)
+./patch.sh ./stalwart-check       # expect exit 6 (already patched)
+```
+
+Or let the checker do all of it, including booting the image:
+
+```bash
+bash .github/patch-check.sh stalwart-patched:0.11.8 /usr/local/bin/stalwart-mail toml
 ```
 
 ## 3. Generate a license key
 
-Use the registrable domain of the hostname the server will run under:
+Use the registrable domain of the hostname the server runs under:
 
 ```bash
 ./generate-license.sh --domain example.com --accounts 1000 > license.key
@@ -45,9 +68,57 @@ cat license.key
 
 ## 4. Start the server
 
-The server needs the data directory and `/etc/stalwart` writable. On first run
-Stalwart bootstraps from `STALWART_HOSTNAME` and writes its own
-`/etc/stalwart/config.json` (the data-store document):
+**0.11.x** — write a TOML config containing the key and boot it:
+
+```bash
+mkdir -p ./data ./etc
+cat > ./etc/config.toml <<EOF
+[server]
+hostname = "mail.example.com"
+
+[storage]
+data = "rocksdb"
+fts = "rocksdb"
+blob = "rocksdb"
+lookup = "rocksdb"
+directory = "internal"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "/opt/stalwart-mail/data"
+compression = "lz4"
+
+[directory."internal"]
+type = "internal"
+store = "rocksdb"
+
+[tracer."stdout"]
+type = "stdout"
+level = "info"
+ansi = false
+enable = true
+
+[enterprise]
+license-key = "$(cat license.key)"
+EOF
+
+docker run -d --name stalwart \
+  -p 443:443 -p 25:25 -p 8080:8080 \
+  -v "$PWD/etc/config.toml":/opt/stalwart-mail/etc/config.toml:ro,Z \
+  -v "$PWD/data":/opt/stalwart-mail/data:Z \
+  stalwart-patched:0.11.8
+
+docker logs -f stalwart
+```
+
+That is the whole story for 0.11.x — the key is read straight from the config
+file, so jump to step 5. (The upstream entrypoint still initialises
+`/opt/stalwart-mail/etc/config.toml` for you if you would rather run it once
+without a config and edit the generated file.)
+
+**0.16.x** — the server needs `/var/lib/stalwart` and `/etc/stalwart`
+writable, and on first run it bootstraps from `STALWART_HOSTNAME` and writes
+its own `/etc/stalwart/config.json`:
 
 ```bash
 mkdir -p ./data
@@ -58,14 +129,15 @@ docker run -d --name stalwart \
   -p 443:443 -p 25:25 -p 8080:8080 \
   -v "$PWD/data":/var/lib/stalwart:Z \
   -v stalwart-etc:/etc/stalwart \
-  stalwart-patched:latest
-
-docker logs -f stalwart
+  stalwart-patched:0.16.23
 ```
 
 ## 5. Apply the license key
 
-In 0.16.x **the license key does not go into `config.json`**. That file is
+**0.11.x** — already done in step 4: the key is the `license-key` value in the
+`[enterprise]` table. No admin account, no API call.
+
+**0.16.x** — **the license key does not go into `config.json`**. That file is
 parsed strictly as the `DataStore` enum, so anything else is rejected with
 `missing field \`@type\``. Settings — including `enterprise.licenseKey` — live
 in the registry (the database) and are managed through the admin API/UI
@@ -86,12 +158,14 @@ interactive:
 
 ## 6. Verify it took effect
 
-The license state is logged at startup by `log_license_details()` (called from
-`crates/main/src/main.rs`). A working patch with a valid-for-this-domain key
-prints:
+Both versions log the outcome at startup. Success looks like:
 
 ```
-Stalwart Enterprise Edition license key is valid
+0.11.x: INFO Server licensing event (server.licensing) details = Stalwart
+        Enterprise Edition license key is valid, domain = "example.com",
+        total = 1000, validFrom = "...", validTo = "..."
+
+0.16.x: Stalwart Enterprise Edition license key is valid
 ```
 
 Failure modes, and what they mean:
@@ -105,44 +179,60 @@ Failure modes, and what they mean:
 | `Invalid license key parameters` | `accounts == 0`, `valid_from >= valid_to`, empty domain |
 | `Failed to decode license key` | not valid base64 (truncated paste) |
 
-Once the success line appears, Enterprise features are gated by
-`Server::is_enterprise_edition()`, which returns true when an unexpired
-license is present.
+Once the success line appears, Enterprise features are gated by the
+`is_enterprise_edition()` check, which returns true when an unexpired license
+is present.
 
 ## 7. New Stalwart version
 
-The four branch sites move, so the patterns must be re-derived:
+The four site addresses move, so the patterns must be re-derived:
 
 ```bash
-TAG=v0.16.24
-CID=$(docker create "stalwartlabs/stalwart:${TAG}" /bin/true)
-docker cp "$CID":/usr/local/bin/stalwart "./stalwart-${TAG#v}-x86_64"
+TAG=v0.11.9                       # or a 0.16.x tag with the other image/binary
+IMG=stalwartlabs/mail-server
+BIN=/usr/local/bin/stalwart-mail
+
+CID=$(docker create "${IMG}:${TAG}" /bin/true)
+docker cp "$CID":"$BIN" "./stalwart-mail-${TAG#v}-x86_64"
 docker rm "$CID" >/dev/null
 
-./patch.sh --dry-run "./stalwart-${TAG#v}-x86_64"   # expect exit 7 (unknown version)
+./patch.sh --dry-run "./stalwart-mail-${TAG#v}-x86_64"   # expect exit 7 (unknown version)
 ```
 
 Then locate the sites and extend `PATTERNS_X86_64`:
 
 1. Find the two 16-byte `.rodata` constants listed in the README — they are
    version-stable, and the code that loads them *is* the license validator.
-2. The `call` immediately before `test al, al` / `je` in each copy is the
-   Ed25519 verify. Ignore copies that never load the license key (DKIM).
-3. Record the two anchor prefixes (`mov edi,1; mov edx,0x20; mov rsi,rbx` and
-   the `[rsp+0x38]` variant) and the branch bytes that follow the wildcarded
-   call.
-4. Add a row with the correct `sites` count; `--dry-run` must report all of
+2. Follow each load forward to `call <verify> ; test al, al` and the
+   conditional after it. The fall-through path materialises
+   `LicenseError::Validation` (discriminant index `4`), which is how you tell
+   a license site from an unrelated Ed25519 check (DKIM at al.).
+3. Anchor the pattern on the argument-loading sequence (`mov edx, 0x20` plus
+   the `mov rsi, ...` that loads the public key) and wildcard the call's
+   relative displacement (`E8 ?? ?? ?? ??`). The `[rsp+disp8]` and
+   `[rsp+disp32]` encodings need separate patterns.
+4. Set `offset` to the `84` of the `test al, al` and `replacement` to `31`.
+   Add a row with the correct `sites` count; `--dry-run` must report all of
    them before you trust it.
+5. Make sure the new patterns do **not** match the other supported versions:
+   version selection requires each version's total match count to equal its
+   own declared `sites`, and refuses to patch if two versions both qualify.
 
 ## Troubleshooting
 
 **Container exits 139 (SIGSEGV) with no output.** Almost always SELinux: add
-`:Z` to the bind mount of the binary. It is not a bad patch.
+`:Z` to the bind mount of the binary (or of the config/data). It is not a bad
+patch.
 
-**`Call not found!` for a version that should work.** Check the binary really
-is the Enterprise build (`--features enterprise` is in the upstream Dockerfile;
-the binary contains `crates/common/src/enterprise/license.rs`). A community
-build has no license code at all.
+**`Call not found!` for a version that should work.** Check that the binary
+really is the Enterprise build (`--features enterprise`, or `enterprise` in the
+feature list, is in the upstream Dockerfile; the binary contains the string
+`crates/common/src/enterprise/license.rs`). A community build has no license
+code at all.
 
 **Key rejected as expired straight away.** `valid_from` must be <= now;
 `generate-license.sh` defaults it to now − 1h. Check the container clock.
+
+**0.16.x: `missing field \`@type\`` on startup.** You put settings into the
+file passed to `--config`. That file must be only a data-store document
+(`{"@type":"RocksDb",...}`); everything else belongs in the registry.

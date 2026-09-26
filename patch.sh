@@ -17,15 +17,21 @@ signature validation.
 Stalwart validates Enterprise licenses offline: the base64 license key is
 parsed and its Ed25519 signature is checked against a public key embedded in
 the binary. The verification result is a Rust Result whose discriminant is
-tested with a conditional jump; inverting that jump makes the signature check
-accept any signature. The license key itself (valid_from/valid_to/accounts/
-domain) is still parsed and enforced normally, so you still need a
-well-formed key issued for your own domain -- see generate-license.sh.
+tested with a conditional jump, and the fall-through path raises
+LicenseError::Validation. Rewriting that test to "xor eax, eax" makes the
+conditional always take the valid-signature path, so the signature check
+always succeeds. The license key itself (valid_from/valid_to/accounts/domain)
+is still parsed and enforced normally, so you still need a well-formed key
+issued for your own domain -- see generate-license.sh.
 
 Unlike Mattermost, one Stalwart binary contains FOUR inlined copies of the
 validator (LicenseKey::new is inlined into its call sites), so every copy has
 to be patched. The patterns are listed per version and every pattern of a
 version must match exactly once.
+
+Supported: Stalwart 0.16.x (stalwartlabs/stalwart, binary "stalwart") and
+Stalwart Mail Server 0.11.x (stalwartlabs/mail-server, binary "stalwart-mail"),
+x86-64 only so far. Run with --list to see all versions.
 
 The architecture (x86-64 / ARM64) is detected from the ELF header.
 
@@ -72,24 +78,56 @@ EOF
 # The check is the inlined body of:
 #     self.public_key.verify(&key[..payload_len], signature)
 #         .map_err(|_| LicenseError::Validation)?;
-# aws_lc_rs returns a Result<(), _>, so al == 0 means "signature valid" and the
-# compiler emits "test al, al; je <valid path>". Inverting the conditional
-# (74 -> 75, 0F 84 -> 0F 85) makes the failure path fall into the "valid"
-# branch, i.e. any signature is accepted.
+# verify returns a Result<(), _> whose discriminant lands in al (0 = Ok, i.e.
+# the signature is valid), so the compiler emits
+#     call <verify> ; test al, al ; je <valid path>
+# with the fall-through path materialising LicenseError::Validation. Patching
+# the test into "xor eax, eax" (84 C0 -> 31 C0) forces ZF=1, so the je always
+# takes the valid-signature path: the signature check always succeeds, for a
+# genuine signature and a forged one alike. This is deliberately used instead
+# of inverting the branch (74 -> 75 / 0F 84 -> 0F 85), which would accept only
+# *invalid* signatures and reject a real license by sending it down the
+# LicenseError::Validation path.
 #
-# The DB 48 89 DE / 48 8B 74 24 38 prefix (mov rsi, rbx / mov rsi,[rsp+0x38])
-# is the public-key Vec argument; it is what distinguishes these four sites
-# from the two unrelated Ed25519 verifications elsewhere in the binary (DKIM),
-# which share the same callee but never load the license public key.
+# The argument-loading sequence in front of the call is what distinguishes
+# these sites from the other Ed25519 verifications in the binary (DKIM et al),
+# which share the same callee but never load the 32-byte license public key:
+#   * 0.16.23 - 48 89 DE (mov rsi, rbx) / 48 8B 74 24 38 (mov rsi,[rsp+0x38])
+#   * 0.11.8  - 48 8B 74 24 xx (mov rsi,[rsp+disp8]) /
+#               48 8B B4 24 xx xx xx xx (mov rsi,[rsp+disp32])
+# All of them load the key with "mov edx, 0x20" (BA 20 00 00 00) immediately
+# before, which pins the 32-byte public key as the verification input.
 #
-# Stalwart 0.16.23, x86-64, virtual addresses of the patched branches:
-#   0x14b9af2  LicenseKey::new (inlined into Enterprise::parse)
-#   0x2429beb  LicenseKey::new (second inlining)
-#   0x4842932  LicenseKey::new (third inlining)
-#   0x484379b  LicenseKey::new (fourth inlining)
+# Note on cross-version overlap: the 0.11.8 disp8 pattern is a suffix of the
+# 0.16.23 disp8 pattern, so it also matches the two 0.16.23 disp8 sites. That
+# is harmless -- version selection compares each version's total match count
+# (intact + already patched) against that version's own declared site count, so
+# for a 0.16.23 binary the 0.11.8 group only reaches 2 of its 4 required sites
+# and is discarded. Only the correct version can ever be selected.
+#
+# Stalwart 0.16.23, x86-64, virtual addresses of the patched test bytes:
+#   0x14b9af0  LicenseKey::new (inlined into Enterprise::parse)
+#   0x2429be8  LicenseKey::new (second inlining)
+#   0x4842930  LicenseKey::new (third inlining)
+#   0x4843798  LicenseKey::new (fourth inlining)
+#
+# Stalwart 0.11.8, x86-64, virtual addresses of the patched test bytes:
+#   0x1949286  LicenseKey::new (inlined)
+#   0x194d34b  LicenseKey::new (second inlining, short branch)
+#   0x272abd7  LicenseKey::new (third inlining)
+#   0x2737004  LicenseKey::new (fourth inlining)
 PATTERNS_X86_64=(
-    "0.16.23|4|BF 01 00 00 00 BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 74 38|20|75"
-    "0.16.23|4|BF 01 00 00 00 BA 20 00 00 00 48 8B 74 24 38 E8 ?? ?? ?? ?? 84 C0 0F 84 40 03 00 00|23|85"
+    # Stalwart 0.16.23 (stalwartlabs/stalwart): the pubkey Vec argument is
+    # passed in rbx (48 89 DE) or reloaded from the stack (48 8B 74 24 38).
+    "0.16.23|4|BF 01 00 00 00 BA 20 00 00 00 48 89 DE E8 ?? ?? ?? ?? 84 C0 74 38|18|31"
+    "0.16.23|4|BF 01 00 00 00 BA 20 00 00 00 48 8B 74 24 38 E8 ?? ?? ?? ?? 84 C0 0F 84 40 03 00 00|20|31"
+    # Stalwart Mail Server 0.11.8 (stalwartlabs/mail-server): stack-slot
+    # encodings differ per inlining (disp8 vs disp32), and one of the four
+    # sites branches with a short je, so its pattern anchors on the error
+    # discriminant that the fall-through path materialises instead.
+    "0.11.8|4|BA 20 00 00 00 48 8B 74 24 ?? E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ??|15|31"
+    "0.11.8|4|BA 20 00 00 00 48 8B B4 24 ?? ?? ?? ?? E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ??|18|31"
+    "0.11.8|4|E8 ?? ?? ?? ?? 84 C0 48 B8 03 00 00 00 00 00 00 80 48 8B 7C 24 ?? 74|5|31"
 )
 
 # ARM64 (aarch64) patterns. The check is a compare-and-branch on the returned
@@ -108,19 +146,39 @@ PUBKEY_ANCHORS=(
     "pubkey[16..32]|48 36 8D 0E 61 DB 02 04 77 8F 9C 0A 98 D8 20 C2"
 )
 
-# List supported versions
+# List supported versions (deduplicated: one line per version, not per pattern)
 list_versions() {
+    local seen=() entry v s skip
     echo "Supported Stalwart versions:"
     echo "x86-64:"
-    for entry in "${PATTERNS_X86_64[@]}"; do
-        echo "  - $(echo "$entry" | cut -d'|' -f1) ($(echo "$entry" | cut -d'|' -f2) sites)"
-    done
+    if [ ${#PATTERNS_X86_64[@]} -eq 0 ]; then
+        echo "  (none yet)"
+    else
+        for entry in "${PATTERNS_X86_64[@]}"; do
+            v=$(echo "$entry" | cut -d'|' -f1)
+            skip=0
+            for s in ${seen[@]+"${seen[@]}"}; do
+                [ "$s" = "$v" ] && skip=1
+            done
+            [ "$skip" -eq 1 ] && continue
+            seen+=("$v")
+            echo "  - $v ($(echo "$entry" | cut -d'|' -f2) sites)"
+        done
+    fi
+    seen=()
     echo "ARM64 (aarch64):"
     if [ ${#PATTERNS_ARM64[@]} -eq 0 ]; then
         echo "  (none yet)"
     else
         for entry in "${PATTERNS_ARM64[@]}"; do
-            echo "  - $(echo "$entry" | cut -d'|' -f1) ($(echo "$entry" | cut -d'|' -f2) sites)"
+            v=$(echo "$entry" | cut -d'|' -f1)
+            skip=0
+            for s in ${seen[@]+"${seen[@]}"}; do
+                [ "$s" = "$v" ] && skip=1
+            done
+            [ "$skip" -eq 1 ] && continue
+            seen+=("$v")
+            echo "  - $v ($(echo "$entry" | cut -d'|' -f2) sites)"
         done
     fi
 }
@@ -516,7 +574,7 @@ for ((i = 0; i < COUNT; i++)); do
 done
 
 if [ "$PENDING_TOTAL" -eq 0 ]; then
-    log "Binary appears to already be patched ($ALREADY/$FOUND_SITES site(s) inverted)."
+    log "Binary appears to already be patched ($ALREADY/$FOUND_SITES site(s) rewritten)."
     exit 6
 fi
 
@@ -547,7 +605,7 @@ for i in "${PENDING[@]}"; do
             exit 8
         fi
 
-        log "  Inverting conditional branch at offset 0x$BYTE_OFFSET_HEX ($ORIGINAL_BYTE -> $replacement)"
+        log "  Rewriting signature check at offset 0x$BYTE_OFFSET_HEX ($ORIGINAL_BYTE -> $replacement, test al,al -> xor eax,eax)"
 
         if [ "$DRY_RUN" -eq 1 ]; then
             continue
@@ -579,4 +637,6 @@ fi
 
 log "Licensing code patched ($PATCHED_COUNT site(s))!"
 log "Generate a license key for your own domain with generate-license.sh and set it"
-log "as enterprise.licenseKey / [enterprise] licenseKey in the Stalwart config."
+log "in the Stalwart configuration as:"
+log "  0.16.x (JSON):  \"enterprise\": { \"licenseKey\": \"<key>\" }"
+log "  0.11.x (TOML):  [enterprise] license-key = \"<key>\""

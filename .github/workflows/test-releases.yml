@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       stalwart_tag:
-        description: 'Specific Stalwart image tag to test (e.g. v0.16.23)'
+        description: 'stalwartlabs/stalwart (0.16.x) tag to test, e.g. v0.16.23'
+        required: false
+        default: ''
+      mail_server_tag:
+        description: 'stalwartlabs/mail-server (0.11.x) tag to test, e.g. v0.11.8'
         required: false
         default: ''
   pull_request:
@@ -20,8 +24,14 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # repo | binary inside the image | container user | patch-check mode
+  VARIANT_016: 'stalwartlabs/stalwart|/usr/local/bin/stalwart|stalwart|json'
+  VARIANT_011: 'stalwartlabs/mail-server|/usr/local/bin/stalwart-mail|root|toml'
+
 jobs:
-  # Nightly and manual runs: build and check the recent released tags.
+  # Nightly and manual runs: build and check the recent released tags of both
+  # product lines.
   check-and-test:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -33,46 +43,53 @@ jobs:
 
       - name: Discover Stalwart tags
         id: discover
+        env:
+          MANUAL_016: ${{ inputs.stalwart_tag }}
+          MANUAL_011: ${{ inputs.mail_server_tag }}
         run: |
           set -euo pipefail
 
-          if [ -n "${{ inputs.stalwart_tag }}" ]; then
-            echo "new_tags=${{ inputs.stalwart_tag }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$MANUAL_016" ] || [ -n "$MANUAL_011" ]; then
+            [ -z "$MANUAL_016" ] || echo "stalwartlabs/stalwart|$MANUAL_016|/usr/local/bin/stalwart|stalwart|json"
+            [ -z "$MANUAL_011" ] || echo "stalwartlabs/mail-server|$MANUAL_011|/usr/local/bin/stalwart-mail|root|toml"
             exit 0
           fi
 
-          # Docker Hub tags API. Exclude edge/nightly style tags; keep the
-          # latest few stable releases. Stalwart tags are vX.Y.Z.
-          TAGS=$(curl -sf "https://hub.docker.com/v2/repositories/stalwartlabs/stalwart/tags?page_size=100" \
-            | python3 -c "
-          import sys, json, re
-          data = json.load(sys.stdin)
-          tags = []
-          for r in data.get('results', []):
-              name = r.get('name', '')
-              if re.fullmatch(r'v?\d+\.\d+\.\d+', name):
-                  tags.append(name)
-          # newest first by semver-ish ordering
-          def key(t):
-              return [int(x) for x in re.findall(r'\d+', t)]
-          tags.sort(key=key, reverse=True)
-          # one per minor version, newest, limited to keep the matrix small
-          seen, out = set(), []
-          for t in tags:
-              minor = '.'.join(t.lstrip('v').split('.')[:2])
-              if minor not in seen:
-                  seen.add(minor)
-                  out.append(t)
-              if len(out) >= 5:
-                  break
-          print('\n'.join(out))
-          ")
+          python3 - <<'PY'
+          import json, re, sys, urllib.request
 
-          DELIMITER="sw_eof"
-          echo "new_tags<<${DELIMITER}" >> "$GITHUB_OUTPUT"
-          echo "$TAGS" >> "$GITHUB_OUTPUT"
-          echo "${DELIMITER}" >> "$GITHUB_OUTPUT"
-          echo "Discovered tags: ${TAGS:-none}"
+          # repo, binary, container user, patch-check mode
+          REPOS = [
+              ("stalwartlabs/stalwart",    "/usr/local/bin/stalwart",      "stalwart", "json"),
+              ("stalwartlabs/mail-server", "/usr/local/bin/stalwart-mail", "root",     "toml"),
+          ]
+
+          for repo, binary, user, mode in REPOS:
+              url = f"https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100"
+              try:
+                  with urllib.request.urlopen(url, timeout=60) as fh:
+                      data = json.load(fh)
+              except Exception as exc:                      # network hiccup: skip repo
+                  print(f"WARN: cannot list {repo} tags: {exc}", file=sys.stderr)
+                  continue
+
+              tags = [r.get("name", "") for r in data.get("results", [])]
+              tags = [t for t in tags if re.fullmatch(r"v?\d+\.\d+\.\d+", t)]
+              tags.sort(key=lambda t: [int(x) for x in re.findall(r"\d+", t)], reverse=True)
+
+              # one (newest) tag per minor version, limited to keep the matrix small
+              seen, picked = set(), []
+              for t in tags:
+                  minor = ".".join(t.lstrip("v").split(".")[:2])
+                  if minor not in seen:
+                      seen.add(minor)
+                      picked.append(t)
+                  if len(picked) >= 3:
+                      break
+
+              for t in picked:
+                  print(f"{repo}|{t}|{binary}|{user}|{mode}")
+          PY
 
       - name: Build and check each tag
         if: steps.discover.outputs.new_tags != ''
@@ -82,22 +99,28 @@ jobs:
 
           OK=""; FAILED=""; UNSUPPORTED=""
 
-          for TAG in "${TAGS[@]}"; do
-            [ -z "$TAG" ] && continue
-            echo "=== Stalwart ${TAG} ==="
+          for ENTRY in "${TAGS[@]}"; do
+            [ -z "$ENTRY" ] && continue
+            IFS='|' read -r REPO TAG BINARY USER MODE <<< "$ENTRY"
+            LOCAL="sw-test:${REPO##*/}-${TAG}"
+            echo "=== ${REPO}:${TAG} (binary=${BINARY}, user=${USER}, mode=${MODE}) ==="
 
-            if ! docker build --build-arg STALWART_IMAGE_TAG="${TAG}" -t "sw-test:${TAG}" . ; then
+            if ! docker build \
+                   --build-arg STALWART_IMAGE="${REPO}:${TAG}" \
+                   --build-arg STALWART_BINARY="${BINARY}" \
+                   --build-arg STALWART_USER="${USER}" \
+                   -t "${LOCAL}" . ; then
               # exit 7 = patterns not derived for this version yet. That is a
               # "needs new patterns" situation, not a broken patch.
-              echo "Patch did not apply to ${TAG}: patterns may not be derived yet"
-              UNSUPPORTED="${UNSUPPORTED}${UNSUPPORTED:+, }${TAG}"
+              echo "Patch did not apply to ${REPO}:${TAG}: patterns may not be derived yet"
+              UNSUPPORTED="${UNSUPPORTED}${UNSUPPORTED:+, }${REPO}:${TAG}"
               continue
             fi
 
-            if bash .github/patch-check.sh "sw-test:${TAG}"; then
-              OK="${OK}${OK:+, }${TAG}"
+            if bash .github/patch-check.sh "${LOCAL}" "${BINARY}" "${MODE}"; then
+              OK="${OK}${OK:+, }${REPO}:${TAG}"
             else
-              FAILED="${FAILED}${FAILED:+, }${TAG}"
+              FAILED="${FAILED}${FAILED:+, }${REPO}:${TAG}"
             fi
           done
 
@@ -110,7 +133,9 @@ jobs:
           echo "FAILED:       ${FAILED:-none}"
           [ -z "$FAILED" ] || exit 1
 
-  # Pull requests: patch and boot-check the tag the patterns were derived from.
+  # Pull requests: patch and check the tag the patterns were derived from, for
+  # both product lines. The 0.11.x check additionally asserts that the patched
+  # server accepts a generated license key at runtime.
   pr-check:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -120,11 +145,23 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Build the patched image
-        run: docker build --build-arg STALWART_IMAGE_TAG=v0.16.23 -t sw-test:pr .
+      - name: Build and check the 0.16.x image
+        run: |
+          set -euo pipefail
+          IFS='|' read -r REPO BINARY USER MODE <<< "$VARIANT_016"
+          docker build --build-arg STALWART_IMAGE="${REPO}:v0.16.23" \
+            --build-arg STALWART_BINARY="${BINARY}" \
+            --build-arg STALWART_USER="${USER}" -t sw-test:pr016 .
+          bash .github/patch-check.sh sw-test:pr016 "${BINARY}" "${MODE}"
 
-      - name: Check the patch and that it boots
-        run: bash .github/patch-check.sh sw-test:pr
+      - name: Build and check the 0.11.x image (includes runtime license check)
+        run: |
+          set -euo pipefail
+          IFS='|' read -r REPO BINARY USER MODE <<< "$VARIANT_011"
+          docker build --build-arg STALWART_IMAGE="${REPO}:v0.11.8" \
+            --build-arg STALWART_BINARY="${BINARY}" \
+            --build-arg STALWART_USER="${USER}" -t sw-test:pr011 .
+          bash .github/patch-check.sh sw-test:pr011 "${BINARY}" "${MODE}"
 
       - name: Verify the license generator still round-trips
         run: |
@@ -145,15 +182,24 @@ jobs:
           print('license round-trip OK')
           PY
 
-      - name: Verify a second patch run is idempotent
+      - name: Verify a second patch run is idempotent on both binaries
         run: |
           set -uo pipefail
-          CID=$(docker create sw-test:pr /bin/true)
-          docker cp "$CID":/usr/local/bin/stalwart /tmp/sw-patched
-          docker rm "$CID" >/dev/null
-          set +e
-          bash patch.sh --quiet /tmp/sw-patched
-          code=$?
-          set -e
-          [ "$code" = "6" ] || { echo "ERROR: expected exit 6 (already patched), got $code"; exit 1; }
-          echo "idempotency OK"
+          IFS='|' read -r _ B16 _ _ <<< "$VARIANT_016"
+          IFS='|' read -r _ B11 _ _ <<< "$VARIANT_011"
+
+          check_idem() {
+            local image="$1" binary="$2" cid code
+            cid=$(docker create "$image" /bin/true)
+            docker cp "$cid":"$binary" /tmp/sw-patched
+            docker rm "$cid" >/dev/null
+            set +e
+            bash patch.sh --quiet /tmp/sw-patched
+            code=$?
+            set -e
+            [ "$code" = "6" ] || { echo "ERROR: $binary expected exit 6 (already patched), got $code"; exit 1; }
+            echo "idempotency OK: $binary"
+          }
+
+          check_idem sw-test:pr016 "$B16"
+          check_idem sw-test:pr011 "$B11"
