@@ -4,9 +4,10 @@
 #   image (if given) to reject that same licence. 0.9.x - 0.11.x, where the
 #   licence sits in a plain config.toml.
 # json: structural check plus a boot. 0.16.x and up, which read config.json.
-# structural: key replacement only. For 0.12.x - 0.15.x, where the licence
-#   lives in the registry (so no key can be asserted at runtime) and the config
-#   is neither TOML nor config.json, so there is nothing meaningful to boot.
+# structural: key replacement only. For releases whose licence is not set
+#   through the config shipped here: 0.9.x - 0.10.x (a TOML schema this script
+#   does not ship) and 0.12.x - 0.15.x (registry, and no config.json to boot
+#   with), so there is nothing meaningful to assert at runtime.
 set -uo pipefail
 
 IMAGE="${1:-}"
@@ -45,8 +46,8 @@ case "$rc" in
 esac
 
 if [ "$MODE" = "structural" ]; then
-    echo "  vendor key replaced, and 0.12.x - 0.15.x keeps its licence in the"
-    echo "  registry, so there is no runtime acceptance to assert here"
+    echo "  vendor key replaced; this release's licence is not set through the"
+    echo "  config this script ships, so there is no runtime check to make"
     echo "PATCH_OK: $IMAGE ($BINARY, mode=$MODE)"
     exit 0
 fi

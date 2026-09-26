@@ -52,44 +52,52 @@ jobs:
           set -euo pipefail
           : > /tmp/discovered.txt
 
-          # The version decides where the licence lives, and therefore what
-          # patch-check can assert: same rule as mode() in the discovery below.
+          # The version decides where the licence lives and which config schema
+          # applies, and therefore what patch-check can assert: same rule as
+          # mode() in the discovery below.
           mode_for() {
             case "${1#v}" in
-              0.9*|0.10*|0.11*) echo toml ;;
-              0.12*|0.13*|0.14*|0.15*) echo structural ;;
+              0.11*) echo toml ;;
+              0.9*|0.10*|0.12*|0.13*|0.14*|0.15*) echo structural ;;
               *) echo json ;;
             esac
           }
 
-          # repo | tag | binary | user | mode
+          # repo | tag | binary | mode
           if [ -n "$MANUAL_NEW" ]; then
-            echo "stalwartlabs/stalwart|$MANUAL_NEW|/usr/local/bin/stalwart|stalwart|$(mode_for "$MANUAL_NEW")" >> /tmp/discovered.txt
+            echo "stalwartlabs/stalwart|$MANUAL_NEW|/usr/local/bin/stalwart|$(mode_for "$MANUAL_NEW")" >> /tmp/discovered.txt
           fi
           if [ -n "$MANUAL_OLD" ]; then
-            echo "stalwartlabs/mail-server|$MANUAL_OLD|/usr/local/bin/stalwart-mail|root|$(mode_for "$MANUAL_OLD")" >> /tmp/discovered.txt
+            echo "stalwartlabs/mail-server|$MANUAL_OLD|/usr/local/bin/stalwart-mail|$(mode_for "$MANUAL_OLD")" >> /tmp/discovered.txt
           fi
 
           if [ -z "$MANUAL_NEW" ] && [ -z "$MANUAL_OLD" ]; then
           python3 - <<'PY' >> /tmp/discovered.txt
           import json, re, sys, urllib.request
 
-          # repo, binary, container user
+          # repo, binary
           REPOS = [
-              ("stalwartlabs/stalwart",    "/usr/local/bin/stalwart",      "stalwart"),
-              ("stalwartlabs/mail-server", "/usr/local/bin/stalwart-mail", "root"),
+              ("stalwartlabs/stalwart",    "/usr/local/bin/stalwart"),
+              ("stalwartlabs/mail-server", "/usr/local/bin/stalwart-mail"),
           ]
 
           def version(tag):
               return tuple(int(x) for x in re.findall(r"\d+", tag))
 
           def mode(tag):
-              # What patch-check can assert depends on where the licence lives:
-              #   0.9 - 0.11   plain config.toml, so acceptance is testable
+              # What patch-check can assert depends on where the licence lives and
+              # on the config schema it ships:
+              #   0.9 - 0.10   TOML, but a schema patch-check does not ship
+              #   0.11         TOML, so the patched server can be booted and
+              #                required to accept a licence
               #   0.12 - 0.15  registry, and no config.json to boot with
               #   0.16+        registry + config.json, so the server can be booted
               v = version(tag)
-              return "toml" if v < (0, 12, 0) else ("json" if v >= (0, 16, 0) else "structural")
+              if v >= (0, 16, 0):
+                  return "json"
+              if v >= (0, 12, 0) or v < (0, 11, 0):
+                  return "structural"
+              return "toml"
 
           def all_tags(repo):
               # This endpoint pages by last-updated, so page one holds the newest
@@ -108,7 +116,7 @@ jobs:
                   pages += 1
               return tags
 
-          for repo, binary, user in REPOS:
+          for repo, binary in REPOS:
               try:
                   tags = all_tags(repo)
               except Exception as exc:                      # network hiccup: skip repo
@@ -124,7 +132,7 @@ jobs:
                   continue
 
               for t in (tags[0], tags[-1]):
-                  print(f"{repo}|{t}|{binary}|{user}|{mode(t)}")
+                  print(f"{repo}|{t}|{binary}|{mode(t)}")
           PY
           fi
 
@@ -149,8 +157,18 @@ jobs:
 
           for ENTRY in "${TAGS[@]}"; do
             [ -z "$ENTRY" ] && continue
-            IFS='|' read -r REPO TAG BINARY USER MODE <<< "$ENTRY"
+            IFS='|' read -r REPO TAG BINARY MODE <<< "$ENTRY"
             LOCAL="sw-test:${REPO##*/}-${TAG}"
+
+            # The container user belongs to the image, not to the product line:
+            # 0.12.x runs as root and ships no setcap, later releases run as an
+            # unprivileged user. Read it from the image so the Dockerfile's
+            # USER/setcap handling stays honest - assuming it broke 0.12.0, whose
+            # build died in setcap with exit 127.
+            docker pull -q "${REPO}:${TAG}" >/dev/null
+            USER=$(docker inspect --format '{{if .Config.User}}{{.Config.User}}{{else}}root{{end}}' "${REPO}:${TAG}" 2>/dev/null) || USER=root
+            [ -n "$USER" ] || USER=root
+
             echo "=== ${REPO}:${TAG} (binary=${BINARY}, user=${USER}, mode=${MODE}) ==="
 
             if ! docker build \

@@ -50,9 +50,17 @@ as an argument).
 
 0.9.x - 0.11.x is a different product line: a different image
 (`stalwartlabs/mail-server`), binary path and container user, so building a
-patched image for it needs the build args shown in the Dockerfile header. That
-line is also the only one whose licence acceptance can be asserted at runtime,
-which is why the CI job builds it on every pull request.
+patched image for it needs the build args shown in the Dockerfile header. Note
+that the container user belongs to the release, not the product line: 0.12.x
+images still run as root (and ship no `setcap`) while 0.16.x runs unprivileged,
+so CI reads the user from the image rather than assuming it.
+
+What CI asserts depends on what each release supports: 0.11.x by booting the
+patched server and requiring it to accept a licence (its licence lives in a plain
+`config.toml`, whose schema is the one shipped here); 0.16.x and up by booting
+with a `config.json`; and 0.9.0 - 0.10.x plus 0.12.x - 0.15.x by key replacement
+alone, since their config schema is not the one shipped here and their licence
+lives in the registry, where no key can be asserted at runtime.
 
 ## Files
 
