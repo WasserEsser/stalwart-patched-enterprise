@@ -77,15 +77,17 @@ jobs:
               tags = [t for t in tags if re.fullmatch(r"v?\d+\.\d+\.\d+", t)]
               tags.sort(key=lambda t: [int(x) for x in re.findall(r"\d+", t)], reverse=True)
 
-              # one (newest) tag per minor version, limited to keep the matrix small
+              # The pattern table covers every release from 0.9.0 on, so exercise
+              # the newest tag of every minor version plus the oldest tag of the
+              # line: that hits both ends of every version range in the table.
               seen, picked = set(), []
               for t in tags:
                   minor = ".".join(t.lstrip("v").split(".")[:2])
                   if minor not in seen:
                       seen.add(minor)
                       picked.append(t)
-                  if len(picked) >= 3:
-                      break
+              if tags and tags[-1] not in picked:
+                  picked.append(tags[-1])
 
               for t in picked:
                   print(f"{repo}|{t}|{binary}|{user}|{mode}")
@@ -110,9 +112,10 @@ jobs:
                    --build-arg STALWART_BINARY="${BINARY}" \
                    --build-arg STALWART_USER="${USER}" \
                    -t "${LOCAL}" . ; then
-              # exit 7 = patterns not derived for this version yet. That is a
-              # "needs new patterns" situation, not a broken patch.
-              echo "Patch did not apply to ${REPO}:${TAG}: patterns may not be derived yet"
+              # The table covers every release from 0.9.0 on, so a failure here
+              # means the patch did not match this build - a pattern regression,
+              # not "not supported yet".
+              echo "Patch did not apply to ${REPO}:${TAG}: no version matched this binary"
               UNSUPPORTED="${UNSUPPORTED}${UNSUPPORTED:+, }${REPO}:${TAG}"
               continue
             fi

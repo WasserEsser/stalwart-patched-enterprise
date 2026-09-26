@@ -14,21 +14,32 @@ plus a `Dockerfile` that builds a patched image from the official one.
 
 ## Supported versions
 
-| Stalwart          | image                        | binary                          | config                          | sites |
-|-------------------|------------------------------|---------------------------------|---------------------------------|-------|
-| 0.16.x (tested 0.16.23) | `stalwartlabs/stalwart`   | `/usr/local/bin/stalwart`        | `/etc/stalwart/config.json`     | 4     |
-| 0.11.x (tested 0.11.8)  | `stalwartlabs/mail-server`| `/usr/local/bin/stalwart-mail`   | `/opt/stalwart-mail/etc/config.toml` | 4 |
+Patterns are derived for **every published release from 0.9.0 to 0.16.23** —
+64 builds across both image repos. Releases whose licence-check bytes are
+identical share one label, so the table holds 37 labels covering:
 
-x86-64 only so far; `patch.sh --list` prints what is compiled in. ARM64
-patterns have not been derived, so `patch.sh` exits 7 on aarch64 rather than
-guessing.
+| line | image | binary | config | releases |
+|------|-------|--------|--------|----------|
+| 0.9.0 – 0.10.7  | `stalwartlabs/mail-server` | `/usr/local/bin/stalwart-mail` | `/opt/stalwart-mail/etc/config.toml` | 12, 1–2 sites each |
+| 0.11.0 – 0.11.8 | `stalwartlabs/mail-server` | `/usr/local/bin/stalwart-mail` | `/opt/stalwart-mail/etc/config.toml` | 8, 4 sites each |
+| 0.12.0 – 0.15.5 | `stalwartlabs/stalwart`   | `/usr/local/bin/stalwart`      | `/etc/stalwart/config.json` | 22, 3–4 sites each |
+| 0.16.0 – 0.16.23| `stalwartlabs/stalwart`   | `/usr/local/bin/stalwart`      | `/etc/stalwart/config.json` | 24, 4 sites each |
 
-Note that 0.11.x and 0.16.x are very different products by now: the older one
-is `stalwartlabs/mail-server` with a single `stalwart-mail` binary, a TOML
-config and runs as root, the newer one is `stalwartlabs/stalwart` with a
-registry database, a JSON data-store document and runs as an unprivileged
-user. The two share the license format and the embedded public key, but not
-the code layout, so each has its own patterns.
+Ranges in `patch.sh --list` (e.g. `0.16.14-0.16.23`) mean "these releases have
+byte-identical sites". Releases before 0.9.0 have no `license.rs` at all — the
+Enterprise edition did not exist — so there is nothing to patch and no pattern
+is invented for them.
+
+x86-64 only so far; ARM64 patterns have not been derived, so `patch.sh` exits 7
+on aarch64 rather than guessing.
+
+Note how much the product changes across that span: 0.9.x–0.11.x are
+`stalwartlabs/mail-server` with a single `stalwart-mail` binary, a TOML config
+and root, while 0.12.0+ are `stalwartlabs/stalwart` with a registry database, a
+JSON data-store document and an unprivileged user, and the key moves from the
+config file into the registry (set through the admin API). The licence format
+and the embedded public key are stable from 0.9.0 on; the code layout is not,
+which is why each label carries its own patterns.
 
 ## How the license check works
 
@@ -310,26 +321,39 @@ singleton in the registry (`enterprise.licenseKey` in `config.rs`), not in
 
 ## Adding a new version
 
-The patterns are version-specific. To add a version:
+The whole table was derived mechanically from the published images, and the same
+tooling regenerates it, so a new release is mostly a re-run:
 
-1. Extract the binary from the image
-   (`docker create <image>` then `docker cp <id>:<binary> .`).
-2. Locate the licence sites: find the two 16-byte public-key constants in
-   `.rodata` (each appears exactly once), then the RIP-relative loads of them;
-   from each load site follow forward to `call <verify> ; test al, al` and the
-   conditional after it. A script that does this for 0.11.8 is a good template:
-   resolve the displacement of every `E8` call in the surrounding region and
-   keep the ones followed by `84 C0`, then classify each by the discriminant
-   materialised on the fall-through path (index `4` = `Validation`).
-3. Build the patterns from the argument-loading sequence (`mov edx, 0x20`
-   plus the `mov rsi, ...` that loads the public key) and set `offset` to the
-   `84` of the `test al, al`, `replacement` to `31`.
-4. Add entries to `PATTERNS_X86_64` with the correct `sites` count and run
-   `./patch.sh --dry-run` — it must report `4 site(s) total, 4 to patch`, and
-   the same patterns must NOT match the other supported versions (or the
-   version-selection step will refuse to patch).
-5. If the version reads its key from a config file (0.11.x style), verify the
-   runtime acceptance as well, with `patch-check.sh ... toml`.
+1. Pull the image and extract the server binary for both architectures:
+   `docker create <image>`, `docker cp <id>:<binary> .` (or
+   `docker pull --platform linux/arm64` for the aarch64 build).
+2. Locate the licence sites. `crates/common/src/enterprise/license.rs` is a
+   `LicenseRef-SEL` file, so the check has to be recognised from the binary:
+   - the Ed25519 public key is embedded (the same 32 bytes from 0.9.0 on) and
+     its RIP-relative loads mark each inlined copy;
+   - a site is `call <verify> ; test al, al ; jcc`, where every copy calls the
+     same verify routine and the fall-through materialises the `LicenseError`
+     discriminant for a failed *parse or signature check*;
+   - that discriminant index is **not constant**: it is 3 in 0.9.0–0.10.5 and 4
+     from 0.10.6 on, because `InvalidDomain`/`RenewalFailed` were inserted
+     ahead of it. Read it from that release's own source enum rather than
+     hardcoding it.
+3. Take the pattern from the argument setup before the call (`mov edx, 0x20`
+   plus whatever loads the key into `rsi`) **and the first 8 bytes of the
+   fall-through**. The trailing context is not decoration: a sibling call that
+   verifies with the same key shares the argument setup, and a pattern stopping
+   at the branch matches both sites. Set `offset` to the index of the `84` of
+   `test al, al` (per pattern — the context length and branch form vary) and
+   `replacement` to `31`.
+4. Add it to `PATTERNS_X86_64` with the right `sites` count, then
+   - `./patch.sh --dry-run <binary>` must report `N site(s) total, N to patch`;
+   - the label must be selected **uniquely** — if two labels both reach their
+     declared count the script refuses to patch, which is the guard against a
+     loose pattern;
+   - `./verify_all.sh` re-checks every reference binary in `bins/`.
+5. If the release reads its key from a config file (0.9.x–0.11.x style), also
+   verify runtime acceptance with `patch-check.sh ... toml`. From 0.12.0 on the
+   key lives in the registry, so that check cannot be scripted the same way.
 
 ## Pitfalls worth knowing
 

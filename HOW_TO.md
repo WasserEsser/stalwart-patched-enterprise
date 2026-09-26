@@ -38,9 +38,11 @@ docker build \
   -t stalwart-patched:0.11.8 .
 ```
 
-Pin a version explicitly — `latest` works but moves under you. If the build
-fails with `Call not found!` (exit 7), that version's patterns are not in the
-table yet; see step 6.
+Pin a version explicitly — `latest` works but moves under you. Every release
+from 0.9.0 to 0.16.23 is in the pattern table (`./patch.sh --list`), so a build
+that fails with `Call not found!` (exit 7) means either a release newer than the
+table or a pattern regression; check `./patch.sh --dry-run` against the
+extracted binary before assuming the first.
 
 ## 2. Check the patch landed
 
@@ -185,38 +187,55 @@ is present.
 
 ## 7. New Stalwart version
 
-The four site addresses move, so the patterns must be re-derived:
+Every release through 0.16.23 is already covered, so this only comes up for a
+release newer than the table. The site addresses move every time, so the
+patterns must be re-derived — do not hand-edit existing rows:
 
 ```bash
-TAG=v0.11.9                       # or a 0.16.x tag with the other image/binary
-IMG=stalwartlabs/mail-server
-BIN=/usr/local/bin/stalwart-mail
+TAG=v0.16.24                      # or a 0.11.x tag with the other image/binary
+IMG=stalwartlabs/stalwart
+BIN=/usr/local/bin/stalwart
 
 CID=$(docker create "${IMG}:${TAG}" /bin/true)
-docker cp "$CID":"$BIN" "./stalwart-mail-${TAG#v}-x86_64"
+docker cp "$CID":"$BIN" "./stalwart-${TAG#v}-x86_64"
 docker rm "$CID" >/dev/null
 
-./patch.sh --dry-run "./stalwart-mail-${TAG#v}-x86_64"   # expect exit 7 (unknown version)
+./patch.sh --dry-run "./stalwart-${TAG#v}-x86_64"   # expect exit 7 (unknown version)
 ```
 
-Then locate the sites and extend `PATTERNS_X86_64`:
+Then either re-run the derivation pipeline in `tools/derivation/` (it collects
+the binaries, finds the sites, regenerates the whole table and validates its
+selection against every binary), or extend `PATTERNS_X86_64` by hand:
 
 1. Find the two 16-byte `.rodata` constants listed in the README — they are
    version-stable, and the code that loads them *is* the license validator.
 2. Follow each load forward to `call <verify> ; test al, al` and the
    conditional after it. The fall-through path materialises
-   `LicenseError::Validation` (discriminant index `4`), which is how you tell
-   a license site from an unrelated Ed25519 check (DKIM at al.).
+   `LicenseError::Validation`, which is how you tell a license site from an
+   unrelated Ed25519 check (DKIM et al.). **That discriminant index is not
+   constant**: it is 3 for 0.9.0–0.10.5 and 4 from 0.10.6 on, so read it from
+   the release's own enum instead of assuming 4.
 3. Anchor the pattern on the argument-loading sequence (`mov edx, 0x20` plus
-   the `mov rsi, ...` that loads the public key) and wildcard the call's
-   relative displacement (`E8 ?? ?? ?? ??`). The `[rsp+disp8]` and
-   `[rsp+disp32]` encodings need separate patterns.
-4. Set `offset` to the `84` of the `test al, al` and `replacement` to `31`.
+   the `mov rsi, ...` that loads the public key), **and keep the first 8 bytes
+   of the fall-through after the branch**. The licence check and a sibling call
+   that verifies with the same key share the argument setup, so a pattern that
+   stops at the branch matches both and the declared count becomes unreachable.
+   Wildcard the call's relative displacement (`E8 ?? ?? ?? ??`); the
+   `[rsp+disp8]` and `[rsp+disp32]` encodings need separate patterns.
+4. Set `offset` to the index of the `84` of the `test al, al` **per pattern**
+   (the context length and branch form differ) and `replacement` to `31`.
    Add a row with the correct `sites` count; `--dry-run` must report all of
    them before you trust it.
 5. Make sure the new patterns do **not** match the other supported versions:
    version selection requires each version's total match count to equal its
    own declared `sites`, and refuses to patch if two versions both qualify.
+   This is the check that catches a pattern that is one byte too loose.
+6. If a wildcard byte in the pattern happens to be a real `0x0a` in the binary,
+   write that token as `0a` rather than `??`: `patch.sh` searches the raw file
+   for patterns without it (grep is line-based, so a wildcard cannot span a
+   newline) and only searches the newline-flattened copy when the token is
+   present. A pattern that needs the flattened copy but omits the token silently
+   under-counts, which shows up as exit 7.
 
 ## Troubleshooting
 
