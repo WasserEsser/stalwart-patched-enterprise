@@ -1,12 +1,12 @@
 # Patched Stalwart image built from the official one.
 #
-#   docker build -t stalwart-patched .                # 0.12.x+
+#   docker build -t stalwart-patched:1.0.0 .          # Stalwart v1.0.0
 #
 #   docker build --build-arg STALWART_IMAGE=stalwartlabs/mail-server:v0.11.8 \
 #     --build-arg STALWART_BINARY=/usr/local/bin/stalwart-mail \
 #     --build-arg STALWART_USER=root -t stalwart-patched:0.11.8 .   # 0.9.x-0.11.x
 
-ARG STALWART_IMAGE=stalwartlabs/stalwart:latest
+ARG STALWART_IMAGE=stalwartlabs/stalwart:v1.0.0
 ARG STALWART_BINARY=/usr/local/bin/stalwart
 
 FROM ${STALWART_IMAGE} AS original
