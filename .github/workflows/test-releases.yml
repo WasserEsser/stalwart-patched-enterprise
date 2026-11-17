@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       stalwart_tag:
-        description: 'stalwartlabs/stalwart (0.12.x+) tag to test, e.g. v0.16.23'
+        description: 'stalwartlabs/stalwart (0.12.x+) tag to test, e.g. v1.0.0'
         required: false
         default: ''
       mail_server_tag:
@@ -197,7 +197,7 @@ jobs:
           echo "FAILED:     ${FAILED:-none}"
           [ -z "$FAILED" ] || exit 1
 
-  # Pull requests: patch and check both product lines, and assert that the
+  # Pull requests: patch and check the 1.0.0 image and the legacy 0.11.x line,\n  # and assert that the
   # patched 0.11.x server accepts a license signed with the matching key at
   # runtime (its key lives in a plain TOML config, so the flow is scriptable).
   pr-check:
@@ -209,14 +209,14 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Build and check the 0.16.x image
+      - name: Build and check the Stalwart 1.0.0 image
         run: |
           set -euo pipefail
           IFS='|' read -r BINARY USER MODE <<< "$VARIANT_NEW"
           docker build \
-            --build-arg STALWART_IMAGE="stalwartlabs/stalwart:v0.16.23" \
+            --build-arg STALWART_IMAGE="stalwartlabs/stalwart:v1.0.0" \
             --build-arg STALWART_BINARY="${BINARY}" \
-            --build-arg STALWART_USER="${USER}" -t sw-test:pr016 . >/dev/null
+            --build-arg STALWART_USER="${USER}" -t sw-test:pr100 . >/dev/null
           bash .github/patch-check.sh sw-test:pr016 "${BINARY}" "${MODE}"
 
       - name: Build and check the 0.11.x image (includes runtime license check)
