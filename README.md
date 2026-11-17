@@ -9,8 +9,8 @@ still rejected.
 ## How to run
 
 ```sh
-# 1. patched image (defaults to stalwartlabs/stalwart:latest, i.e. 0.12.x+)
-docker build -t stalwart-patched .
+# 1. patched image (defaults to stalwartlabs/stalwart:v1.0.0)
+docker build -t stalwart-patched:1.0.0 .
 
 # 2. licence
 ./generate-license.sh --domain example.com > license.key
@@ -39,11 +39,11 @@ To patch a binary directly instead of building an image:
 
 | Range | Status |
 |---|---|
-| 0.9.0 – 0.16.23 | supported, both Docker Hub repos, x86-64 and aarch64 |
+| 1.0.0 | source key confirmed identical; CI checks v1.0.0 image on the PR |\n| 0.9.0 – 0.16.23 | supported, both Docker Hub repos, x86-64 and aarch64 |
 | 0.3.0 – 0.8.5 | not applicable: no `license.rs`, so no key to replace |
 
-The key is identical in every supported build and appears exactly once as two
-16-byte halves, which is why no per-version patterns are needed.
+The key in v1.0.0 source matches the earlier versions, and reference binaries are expected to contain exactly one occurrence of each of the two
+16-byte halves, so no new per-version byte patterns are currently needed.\nThe patcher now refuses ambiguous binaries with multiple matches, rather than\nmodifying every occurrence. The v1.0.0 image must pass the GitHub Actions check\nbefore support is considered validated.
 `./check-coverage.sh` checks that property over every reference binary, extracted
 from each release's image or tarball into `./bins` (any directory can be passed
 as an argument).
@@ -57,7 +57,7 @@ so CI reads the user from the image rather than assuming it.
 
 What CI asserts depends on what each release supports: 0.11.x by booting the
 patched server and requiring it to accept a licence (its licence lives in a plain
-`config.toml`, whose schema is the one shipped here); 0.16.x and up by booting
+`config.toml`, whose schema is the one shipped here); 0.16.x and up (including 1.0.0) by booting
 with a `config.json`; and 0.9.0 - 0.10.x plus 0.12.x - 0.15.x by key replacement
 alone, since their config schema is not the one shipped here and their licence
 lives in the registry, where no key can be asserted at runtime.
@@ -75,5 +75,5 @@ check-coverage.sh      asserts every reference binary is patchable
 Notes: the key pair is in this repository, so it is not secret - it
 only signs licences for binaries patched with its public key. Licence renewal
 against `license.stalw.art` fails, which is expected; `--days` defaults to 10
-years. On 0.12.x and later, acceptance cannot be asserted automatically, so
+years. On 0.12.x and later, acceptance is not asserted by this test suite, so
 `patch-check.sh` verifies those builds structurally.
