@@ -5,7 +5,8 @@
 # found, 8 only one half present, 9 write failed, 10 read-back mismatch.
 set -uo pipefail
 
-# Vendor key (license.rs: UnparsedPublicKey::new(&ED25519, vec![118, 10, ...]))
+# Vendor key (verified unchanged in Stalwart v1.0.0:
+# crates/common/src/enterprise/license.rs, LicenseValidator::new()).
 VENDOR_A=760ab623596f0b3c9a2fcd7f6be53768
 VENDOR_B=48368d0e61db0204778f9c0a98d820c2
 
@@ -97,6 +98,13 @@ fi
 if [ "${#A_OFFS[@]}" -eq 0 ] || [ "${#B_OFFS[@]}" -eq 0 ]; then
     echo "Error: found only one of the two key halves" >&2
     echo "       (first: ${#A_OFFS[@]}, second: ${#B_OFFS[@]}); refusing to patch." >&2
+    exit 8
+fi
+
+if [ "${#A_OFFS[@]}" -ne 1 ] || [ "${#B_OFFS[@]}" -ne 1 ]; then
+    echo "Error: expected exactly one occurrence of each public-key half;" >&2
+    echo "       found ${#A_OFFS[@]} first-half and ${#B_OFFS[@]} second-half occurrences." >&2
+    echo "       Refusing to modify an unrecognised or ambiguous binary." >&2
     exit 8
 fi
 
